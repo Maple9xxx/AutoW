@@ -51,6 +51,10 @@
                 gemini:     { model: 'gemini-2.5-flash', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' },
             },
             REQUEST_TIMEOUT: 45000,
+            // ── Network-resilience config ────────────────────────────────────
+            MAX_RETRIES           : 2,     // số lần thử lại khi AI lỗi mạng (tổng = 3 lần)
+            RETRY_BASE_DELAY      : 3000,  // delay cơ bản giữa các lần retry (ms), tăng dần × attempt
+            FALLBACK_RECONNECT_EVERY: 3,   // cứ mỗi N vòng V5-fallback → tự thử reconnect AI lại
         },
         SFX_KEY     : 'gb_v5_sfx_on',
         VIB_KEY     : 'gb_v5_vibrate_on',
@@ -1507,6 +1511,16 @@
         let running = false, timer = null, rounds = 0;
         let maxRounds = 0, tpPct = 0, slPct = 0;
 
+        // ── Network-resilience state ─────────────────────────────────────────
+        // Engine KHÔNG dừng khi AI lỗi mạng. Thay vào đó:
+        //   1. Retry tối đa MAX_RETRIES lần với backoff
+        //   2. Nếu vẫn fail → chuyển V5 Pattern Engine làm fallback
+        //   3. Mỗi FALLBACK_RECONNECT_EVERY vòng → thử ping AI lại
+        //   4. Khi AI online trở lại → tự động resume dùng AI
+        let consecutiveAiFailures = 0;  // tổng số lần AI fail liên tiếp
+        let inAiFallback = false;       // đang chạy V5 thay AI?
+        let fallbackRoundCount = 0;     // đã chạy bao nhiêu vòng trong fallback
+
         // ── Tiered xu state ──────────────────────────────────────────────────
         // xuTiers: [{xuOptIndex: number, maxLosses: number}, ...]
         // Tier 0 = base (cheapest). On ANY win → reset to tier 0.
@@ -1583,21 +1597,86 @@
             const thuOpts = Array.from(thuEl.options);
             const n = thuOpts.length;
 
-            Panel.log('Dang goi AI...');
             let aiDecision;
             const roundId = V5.getHistorySize() + 1; // dong bo voi V5 history de khop nhat ky
-            try {
-                aiDecision = await AI.choose({
-                    n,
-                    options: thuOpts.map(o => o.text),
-                    memory: V5.getMemorySnapshot(12),
-                    round: roundId,
-                });
-            } catch (err) {
-                Panel.log(`AI loi: ${err?.message || err}`);
-                stop(true);
-                return;
+
+            // ── Retry + V5 Fallback khi mạng kém / AI không phản hồi ─────────────
+            // Logic:
+            //  • Bình thường → gọi AI (không fallback)
+            //  • Đang fallback → cứ mỗi FALLBACK_RECONNECT_EVERY vòng thử reconnect
+            //  • Retry tối đa MAX_RETRIES lần với backoff rồi mới chuyển fallback
+            //  • Khi AI online trở lại → tự động thoát khỏi fallback, log thông báo
+            const shouldTryReconnect = inAiFallback
+                && fallbackRoundCount > 0
+                && (fallbackRoundCount % CFG.AI.FALLBACK_RECONNECT_EVERY === 0);
+
+            let aiCallSucceeded = false;
+
+            if (!inAiFallback || shouldTryReconnect) {
+                if (shouldTryReconnect) {
+                    Panel.log(`[Reconnect] Thu ket noi lai AI... (fallback x${fallbackRoundCount})`);
+                }
+                for (let attempt = 0; attempt <= CFG.AI.MAX_RETRIES; attempt++) {
+                    if (!running) return;
+                    const attemptLabel = attempt > 0 ? ` (thu ${attempt + 1}/${CFG.AI.MAX_RETRIES + 1})` : '';
+                    Panel.log(`Goi AI${attemptLabel}...`);
+                    try {
+                        aiDecision = await AI.choose({
+                            n,
+                            options: thuOpts.map(o => o.text),
+                            memory: V5.getMemorySnapshot(12),
+                            round: roundId,
+                        });
+                        // ── Thành công ──
+                        if (inAiFallback) {
+                            Panel.log(`✓ AI ket noi lai! (sau ${consecutiveAiFailures} lan that bai / ${fallbackRoundCount} vong fallback)`);
+                            inAiFallback = false;
+                            fallbackRoundCount = 0;
+                        }
+                        consecutiveAiFailures = 0;
+                        aiCallSucceeded = true;
+                        break;
+                    } catch (err) {
+                        consecutiveAiFailures++;
+                        const isLastAttempt = attempt >= CFG.AI.MAX_RETRIES;
+                        const errShort = String(err?.message || err).slice(0, 65);
+                        if (!isLastAttempt) {
+                            const delay = CFG.AI.RETRY_BASE_DELAY * (attempt + 1);
+                            Panel.log(`✗ AI loi (${attempt + 1}/${CFG.AI.MAX_RETRIES + 1}) → thu lai sau ${delay / 1000}s: ${errShort}`);
+                            await sleep(delay);
+                        } else {
+                            // Hết retry → kích hoạt V5 fallback (KHÔNG dừng engine)
+                            Panel.log(`✗ AI het retry → V5 fallback #${consecutiveAiFailures}: ${errShort}`);
+                            inAiFallback = true;
+                        }
+                    }
+                }
             }
+
+            // Dùng V5 Pattern Engine làm nguồn dự đoán khi AI offline
+            if (!aiCallSucceeded) {
+                fallbackRoundCount++;
+                const v5d = V5.decide(n);
+                const nextRecon = CFG.AI.FALLBACK_RECONNECT_EVERY - (fallbackRoundCount % CFG.AI.FALLBACK_RECONNECT_EVERY);
+                aiDecision = {
+                    picked  : v5d.picked,
+                    provider: 'v5_fallback',
+                    model   : 'pattern_engine',
+                    confidence: v5d.confidence || 0,
+                    reason  : `[AI offline · fail #${consecutiveAiFailures} · fallback vong ${fallbackRoundCount}]`
+                             + ` V5 Pattern Engine thay the. Mode: ${v5d.mode || 'N/A'}.`
+                             + ` Se tu dong kiem tra lai AI sau ${nextRecon} vong nua.`,
+                    latencyMs: 0,
+                    ok      : false,
+                    mode    : 'V5_FALLBACK',
+                    strategiesUsed: v5d.strategiesUsed || [],
+                    votes   : v5d.votes || {},
+                    memory  : V5.getMemorySnapshot(12),
+                    round   : roundId,
+                };
+                Panel.log(`[V5 #${fallbackRoundCount}] Pick: ${thuOpts[v5d.picked]?.text || `#${v5d.picked + 1}`} | Conf ${Math.round((v5d.confidence || 0) * 100)}% | reconnect sau ${nextRecon} vong`);
+            }
+            // ── End retry/fallback ──────────────────────────────────────────────
 
             const finalPick = Math.max(0, Math.min(n - 1, aiDecision.picked));
             triggerSelect(thuEl, thuOpts[finalPick].value);
@@ -1680,6 +1759,10 @@
             rounds = 0;
             currentTierIdx = 0;
             tierLossCount  = 0;
+            // Reset network-resilience state cho session mới
+            consecutiveAiFailures = 0;
+            inAiFallback = false;
+            fallbackRoundCount = 0;
             Feedback.unlock();
             Tracker.startSession();
             Panel.setStatus('run');
