@@ -481,72 +481,19 @@
         S.busy = true;
 
         try {
-            // 0. Doc DOM de kiem tra tinh huong
-            const dom = readGameDOM();
-
-            // 1. Doc API
+            // 1. Doc API (bo qua DOM vi Vue ko refresh)
             const d = await getRoom();
             if (!d) {
-                // Fallback dung DOM neu API loi
-                if (dom.status >= 0) {
-                    S.status = dom.status;
-                    S.action = '📡 DOM: ' + ['Chờ','Chơi','Xong'][dom.status] || '?';
-                    S.busy = false; ui(); return;
-                }
                 S.action = '⏳ Chờ phòng...';
                 await sleep(CFG.POLL_INTERVAL);
                 return;
             }
             ui();
 
-            // QUY TAC: API la chinh, DOM chi la phu tro
-            // - Neu DOM thay ket thuc (2) ma API dang choi (1) => DOM dung, game da xong
-            // - Neu DOM thay idle (0) ma API noi khac => TIN API (DOM co the cu do Vue ko refresh)
-            // - Neu API khong co status => dung DOM de phan doan
-            let effectiveSt = S.status;
-
-            // 1) forceIdle = true => luon idle
-            if (S.forceIdle) {
-                effectiveSt = 0;
-                S.status = 0;
-                log('🔄 forceIdle: giu status=0');
-            }
-            // 2) processedRound = 2 => da xu ly xong, cho tick moi
-            else if (S.processedRound === 2) {
-                effectiveSt = 0;
-                log('🔄 processedRound=2: tam giu status=0');
-            }
-            // 3) DOM thay ket thuc (2) nhung API dang choi (1) => tin DOM
-            else if (dom.status === 2 && S.status === 1) {
-                effectiveSt = 2;
-                S.status = 2;
-                log('📡 DOM thay ket qua, chuyen sang ended');
-            }
-            // 4) DOM thay idle (0) nhung API dang choi (1) => TIN API
-            //    (Vue ko refresh nen DOM van cu)
-            else if (dom.status === 0 && S.status === 1) {
-                // Giu nguyen status=1, ko ghi de
-                effectiveSt = 1;
-                log('📡 DOM thay idle nhung API=1, bo qua DOM');
-            }
-            // 5) API khong co trang thai, dung DOM
-            else if (S.status < 0 && dom.status >= 0) {
-                effectiveSt = dom.status;
-                S.status = dom.status;
-                log(`📡 Dung DOM de xac dinh trang thai: ${dom.status}`);
-            }
-
-            // PHAT HIEN KET: neu o 1 trang thai qua lau, force refresh
-            if (S.status !== S._lastStatus) {
-                S.stuckTicks = 0;
-                S._lastStatus = S.status;
-                S._lastStatusTime = Date.now();
-            } else {
-                S.stuckTicks++;
-            }
-            if (S.stuckTicks > 6 && S.status >= 0) {  // > 120s cung 1 trang thai
-                log('⚠️ KET qua lau (' + S.stuckTicks + ' ticks), reload page...');
-                // Save state before reload
+            // 2. Dem tick de phat hien ket (neu qua 7 tick ~20s thi reload)
+            S._tickCount = (S._tickCount || 0) + 1;
+            if (S._tickCount > 7) {
+                log('⚠️ Qua 7 tick, reload de dong bo Vue...');
                 try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
                 location.reload();
                 return;
@@ -554,33 +501,18 @@
 
             // === STATUS 2: Game ended ===
             if (S.status === 2) {
-                // Neu dang trong trang thai idle ep buoc, bo qua
-                if (S.forceIdle) {
-                    S.status = 0;
-                    return;
-                }
-
                 S.action = '🏁 Kết thúc';
 
-                // Chi xu ly neu chua xu ly round nay
                 if (S.processedRound !== 2 && d.ketquas?.userWin) {
                     await handleResult(d);
                 }
 
                 if (CFG.AUTO_RESTART) {
                     await continueGame();
-                    // processedRound van = 2 de chan API ghi de status o tick sau
-                    await sleep(500);
-                    S.status = 0;
-                    // processedRound KHONG reset ve 0 o day!
-                    // Tick sau se thay processedRound=2 => force status=0
-                    // Khi vao case 0 moi reset processedRound
-                    S.action = '🔄 Sẵn sàng ván mới';
-                    // Refresh balance
-                    const d2 = await api('/api/home', 'GET');
-                    if (d2?.meta?.user?.coin) {
-                        S.bal = parseInt(d2.meta.user.coin.replace(/\./g, ''));
-                    }
+                    S.processedRound = 2;
+                    try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
+                    log('🔄 Reload page...');
+                    location.reload();
                 }
                 return;
             }
@@ -589,30 +521,14 @@
             if (S.status === 1) {
                 S.action = '🎮 Theo dõi...';
 
-                // Kiem tra DOM: neu thay ket qua, cho API cap nhat
-                if (dom.status === 2) {
-                    log('📡 DOM thay ket qua, refresh API...');
-                    await sleep(1000);
-                    const d2 = await getRoom();
-                    if (d2) {
-                        if (S.status === 2) {
-                            S.processedRound = 1; // danh dau de vong sau xu ly
-                        }
-                        // Neu S.status van la 1 ma DOM bao xong, tu chuyen
-                        if (S.status === 1 && dom.status === 0) {
-                            log('📡 DOM thay start button, chuyen sang idle');
-                            S.status = 0;
-                            S.action = '⏸ Chuyển sang idle';
-                        }
-                    }
-                }
-
                 if (d.ketquas?.userWin && S.processedRound !== 2) {
                     await handleResult(d);
                     if (CFG.AUTO_RESTART) {
                         await continueGame();
-                        S.status = 0;
-                        // processedRound van = 2 de chan API
+                        S.processedRound = 2;
+                        try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
+                        log('🔄 Reload page...');
+                        location.reload();
                     }
                     return;
                 }
@@ -627,14 +543,11 @@
             // === STATUS 0: Idle ===
             if (S.status === 0) {
                 S.action = '⏸ Phòng trống';
-                S.forceIdle = false;
                 S.processedRound = 0;
 
-                // Check if we have ticket already
                 const uid = d.meta?.user?.id;
                 const hasTicket = d.playerInfo && d.playerInfo[String(uid)];
 
-                // Nếu chưa có vé: cấu hình → thêm bot → mua vé + start
                 if (!hasTicket) {
                     S.action = '🎫 Chuẩn bị...';
                     calcBet();
@@ -642,15 +555,22 @@
                     await sleep(CFG.DELAY);
                     await addBots();
                     await sleep(CFG.DELAY);
-                    await startGame();
+                    if (!await startGame()) {
+                        log('⚠️ Start that bai, tick sau thu lai');
+                    } else {
+                        S._tickCount = 0;
+                    }
                 } else {
-                    // Có vé rồi: chỉ thêm bot + start
                     S.action = '🤖 Thêm bot...';
                     if (d.playerCountBot < CFG.MAX_BOTS) {
                         await addBots();
                         await sleep(CFG.DELAY);
                     }
-                    await startGame();
+                    if (!await startGame()) {
+                        log('⚠️ Start that bai, tick sau thu lai');
+                    } else {
+                        S._tickCount = 0;
+                    }
                 }
                 return;
             }
@@ -665,6 +585,7 @@
             ui();
         }
     }
+
 
     // ============================================================
     // UI
