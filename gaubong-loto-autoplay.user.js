@@ -504,15 +504,17 @@
                 S.action = '🏁 Kết thúc';
 
                 if (S.processedRound !== 2 && d.ketquas?.userWin) {
-                    await handleResult(d);
-                }
-
-                if (CFG.AUTO_RESTART) {
-                    await continueGame();
-                    S.processedRound = 2;
-                    try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
-                    log('🔄 Reload page...');
-                    location.reload();
+                    const res = await handleResult(d);
+                    if (res && CFG.AUTO_RESTART) {
+                        await continueGame();
+                        S.processedRound = 2;
+                        try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
+                        log('🔄 Reload page...');
+                        location.reload();
+                    }
+                } else {
+                    // Chua co ket qua, cho tick sau
+                    S.action = '🏁 Đợi kết quả...';
                 }
                 return;
             }
@@ -522,8 +524,8 @@
                 S.action = '🎮 Theo dõi...';
 
                 if (d.ketquas?.userWin && S.processedRound !== 2) {
-                    await handleResult(d);
-                    if (CFG.AUTO_RESTART) {
+                    const res = await handleResult(d);
+                    if (res && CFG.AUTO_RESTART) {
                         await continueGame();
                         S.processedRound = 2;
                         try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
@@ -833,13 +835,13 @@ box-shadow:0 8px 40px rgba(0,0,0,.6);">
         try {
             const saved = GM_getValue('loto_session', '{}');
             const sess = JSON.parse(saved);
-            if (sess.streak) S.streak = sess.streak;
-            if (sess.profit) S.profit = sess.profit;
-            if (sess.wins) S.wins = sess.wins;
-            if (sess.losses) S.losses = sess.losses;
-            if (sess.round) S.round = sess.round;
-            if (sess.bet) S.bet = sess.bet;
-            if (sess.initBal) S.initBal = sess.initBal;
+        if (sess.streak !== undefined) S.streak = sess.streak;
+        if (sess.profit !== undefined) S.profit = sess.profit;
+        if (sess.wins !== undefined) S.wins = sess.wins;
+        if (sess.losses !== undefined) S.losses = sess.losses;
+        if (sess.round !== undefined) S.round = sess.round;
+        if (sess.bet !== undefined) S.bet = sess.bet;
+        if (sess.initBal !== undefined) S.initBal = sess.initBal;
         } catch(e) {}
         loadConfig();
         createUI();
