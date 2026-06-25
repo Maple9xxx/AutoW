@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         GauBong Loto Auto-Play - Martingale 🎰
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
-// @description  Auto Lô Tô Gaubong.us - Quét tình huống định kỳ, gấp thếp thông minh
+// @version      2.1.1
+// @description  Tự động chơi Lô Tô Gaubong.us. Chiến thuật gấp thếp vừa phải dựa trên payout ratio. Luôn có lãi khi thắng.
 // @author       AutoPlay
-// @match        https://gaubong.us/*
+// @match        https://gaubong.us/game/loto/room*
+// @match        https://gaubong.us/game/loto
 // @icon         https://gaubong.us/favicon.ico
 // @grant        GM_notification
 // @grant        GM_setValue
@@ -18,19 +19,39 @@
     'use strict';
 
     // ============================================================
-    // CẤU HÌNH
+    // CẤU HÌNH - Chỉnh sửa thoải mái
     // ============================================================
     const CFG = {
+        // Loại game: 1=50 số, 2=90 số
         GAME_TYPE: 1,
-        BASE_BET: 30_000_000,
-        MULTIPLIER: 1.2,          // Tự động: X = P/(P-1), dùng min(CFG, optimal)
-        MAX_BET: 500_000_000,
-        MIN_BET: 1_000_000,
+
+        // === CHIẾN THUẬT GẤP THẾP ===
+        // Tiền cược cơ bản (ván đầu tiên sau khi thắng)
+        BASE_BET: 10_000_000,           // 10 triệu xu
+
+        // Hệ số nhân khi thua - công thức: X = P/(P-1) với P = số người chơi
+        // Với 5 bot + bạn = 6 người: X = 6/5 = 1.2
+        // Đây là multiplier tối ưu: lợi nhuận LUÔN = BASE_BET * (P-1) bất kể streak
+        // Ví dụ: BASE_BET=10M, P=6 → lãi luôn = 10M*5 = 50M mỗi khi thắng
+        MULTIPLIER: 1.2,
+
+        // Giới hạn trên của vé (tránh bet quá lớn)
+        MAX_BET: 200_000_000,           // 200 triệu
+
+        // Giới hạn dưới của vé
+        MIN_BET: 1_000_000,             // 1 triệu
+
+        // === BOT ===
         MAX_BOTS: 5,
-        SCAN_MS: 2000,            // Quét mỗi 2 giây
+
+        // === AUTO ===
+        DELAY: 1500,                    // ms chờ giữa các thao tác
+        POLL_INTERVAL: 3000,            // ms kiểm tra game
         AUTO_RESTART: true,
         NOTIFY: true,
-        MAX_BALANCE_USAGE: 0.75,
+
+        // === AN TOÀN ===
+        MAX_BALANCE_USAGE: 0.75,        // chỉ dùng tối đa 75% số dư cho gấp thếp
     };
 
     // ============================================================
@@ -39,26 +60,23 @@
     const S = {
         running: false,
         roomId: null,
-        status: -1,         // 0=idle, 1=playing, 2=ended
+        status: -1,
         bal: 0,
         initBal: 0,
+        bet: CFG.BASE_BET,
         bots: 0,
-        players: 0,
         round: 0,
         wins: 0,
         losses: 0,
         streak: 0,
         profit: 0,
-        action: '⏸ Đã dừng',
-        lastAction: '',
+        busy: false,
+        ended: false,
+        processedRound: 0,  // 0=chua xu ly, 1=dang choi, 2=da xu ly ket qua
+        domStatus: -1,      // trang thai tu DOM
+        action: '',
         startTime: null,
-        errorMsg: '',
-        initDone: false,
-        lock: false,        // Lock để tránh 2 scanner chạy overlap
-        scannerId: null,
-        lastBet: 0,
-        hadTicket: false,
-        processedRound: 0,  // 0=chưa xử lý, 1=đã start, 2=đã xử lý kết quả
+        betHistory: [],       // lưu các bet trong chuỗi thua
     };
 
     // ============================================================
@@ -78,6 +96,7 @@
     }
 
     function fmt(n) { return Math.floor(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.'); }
+
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
     function csrf() {
@@ -85,95 +104,46 @@
         return m ? m[1] : '';
     }
 
-    function $(id) { return document.getElementById(id); }
-
     // ============================================================
-    // DOM READER - DOc tinh huong tu giao dien (quan trong!)
+    // DOM READER - Doc tinh huong tu giao dien (tranh bi kep)
     // ============================================================
     function readGameDOM() {
-        const state = {
-            hasStartBtn: false,
-            hasStopBtn: false,
-            hasSpinText: false,
-            hasCountdown: false,
-            hasResultText: false,
-            hasMyTicket: false,
-            domStatus: -1,     // -1=unknown, 0=idle, 1=playing, 2=ended
-            botElements: 0,
-            debug: ''
-        };
+        const r = { startBtn: false, stopBtn: false, hasResult: false, hasCountdown: false, status: -1 };
         try {
             const txt = document.body.textContent.toLowerCase();
-            state.debug = 'bodyLen=' + txt.length;
-
-            // Tim nut Bat dau / Start / Choi
-            const buttons = document.querySelectorAll('button');
-            for (const btn of buttons) {
-                const t = btn.textContent.trim().toLowerCase();
-                if (t.includes('bat dau') || t === 'start' || t.includes('choi') || t.includes('new game'))
-                    state.hasStartBtn = true;
-                if (t.includes('dung') || t === 'stop' || t.includes('ket thuc'))
-                    state.hasStopBtn = true;
+            for (const b of document.querySelectorAll('button')) {
+                const t = b.textContent.trim().toLowerCase();
+                if (t.includes('bat dau') || t === 'start' || t.includes('choi') || t.includes('new game')) r.startBtn = true;
+                if (t.includes('dung') || t === 'stop' || t.includes('ket thuc') || t.includes('tiep tuc')) r.stopBtn = true;
             }
-            state.debug += ' | startBtn=' + state.hasStartBtn + ' stopBtn=' + state.hasStopBtn;
-
-            // Tu khoa trang thai
-            if (txt.includes('dang quay') || txt.includes('quay so') || txt.includes('dang xo') || txt.includes('spinning'))
-                state.hasSpinText = true;
-            if (txt.includes('ket qua') || txt.includes('result') || txt.includes('kq'))
-                state.hasResultText = true;
-            // Dem nguoc: pattern so:phut hoac "con X giay"
-            var timePattern = /\d+\s*:\s*\d{2}/;
-            if (timePattern.test(txt) && (txt.includes('giay') || txt.includes('con') || txt.includes('timer') || txt.includes('time')))
-                state.hasCountdown = true;
-
-            // Bot elements
-            const botEls = document.querySelectorAll('[class*="bot"], [id*="bot"]');
-            state.botElements = botEls.length;
-
-            // Tim ten minh trong player list
-            const items = document.querySelectorAll('[class*="player"], [class*="member"], li, tr');
-            for (const item of items) {
-                if (item.textContent.includes('NoName007')) {
-                    state.hasMyTicket = true;
-                    break;
-                }
-            }
-
-            // Suy luan trang thai tu DOM
-            if (state.hasResultText)
-                state.domStatus = 2;  // ket thuc
-            else if (state.hasSpinText || state.hasStopBtn || state.hasCountdown)
-                state.domStatus = 1;  // dang choi
-            else if (state.hasStartBtn)
-                state.domStatus = 0;  // san sang
-
-        } catch(e) {
-            state.debug += ' | ERR=' + e.message;
-        }
-        return state;
+            if (txt.includes('ket qua') || txt.includes('result') || txt.includes('kq')) r.hasResult = true;
+            if (txt.includes('dang quay') || txt.includes('quay so') || txt.includes('dang xo')) r.hasCountdown = true;
+            if (r.hasResult) r.status = 2;
+            else if (r.hasCountdown || r.stopBtn) r.status = 1;
+            else if (r.startBtn) r.status = 0;
+        } catch(e) {}
+        return r;
     }
-
 
     // ============================================================
     // API
     // ============================================================
     async function api(endpoint, method = 'POST', data = {}) {
         const url = location.origin + endpoint;
-        const headers = {
-            'X-CSRF-Token': csrf(),
-            'X-Requested-With': 'XMLHttpRequest',
-        };
-        if (method === 'POST') {
-            headers['Content-Type'] = 'application/x-www-form-urlencoded';
-        }
-        const body = method === 'POST'
-            ? Object.entries(data).map(([k, v]) =>
-                encodeURIComponent(k) + '=' + encodeURIComponent(v)
-              ).join('&')
-            : undefined;
+        const body = Object.entries(data).map(([k, v]) =>
+            encodeURIComponent(k) + '=' + encodeURIComponent(v)
+        ).join('&');
         try {
-            const r = await fetch(url, { method, headers, credentials: 'include', body });
+            const r = await fetch(url, {
+                method,
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-CSRF-Token': csrf(),
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                credentials: 'include',
+                body: method === 'POST' ? body : undefined,
+            });
             if (!r.ok) return null;
             const txt = await r.text();
             if (txt.startsWith('<')) return null;
@@ -184,705 +154,698 @@
     // ============================================================
     // ROOM INFO
     // ============================================================
-    async function extractRoomId() {
-        // Try URL patterns
-        const patterns = [
-            /room\?id=(\d+)/, /room\/(\d+)/, /loto\?id=(\d+)/,
-            /loto\/(\d+)/, /game\/(\d+)/, /\/(\d+)\/room/
-        ];
-        for (const pat of patterns) {
-            const m = location.href.match(pat);
-            if (m) return m[1];
-        }
-
-        // Try DOM links
-        const links = document.querySelectorAll('a[href*="room"], a[href*="loto"]');
-        for (const a of links) {
-            const href = a.href || '';
-            const m = href.match(/room\?id=(\d+)/) || href.match(/room\/(\d+)/)
-                    || href.match(/loto\?id=(\d+)/) || href.match(/loto\/(\d+)/);
-            if (m) return m[1];
-        }
-
-        // Try script tags
-        for (const script of document.querySelectorAll('script')) {
-            const txt = script.textContent || '';
-            const m = txt.match(/"id"\s*:\s*"(\d+)"/);
-            if (m) return m[1];
-        }
-
-        return null;
-    }
-
     async function getRoom() {
-        // Auto-detect room ID if not set
         if (!S.roomId) {
-            S.roomId = await extractRoomId();
-        }
-
-        // If still no room ID, try API
-        if (!S.roomId) {
-            const d = await api('/api/game/loto/room', 'GET');
-            if (d && d.room && d.room.id) {
-                S.roomId = d.room.id;
-            } else if (d && d.id) {
-                S.roomId = d.id;
-            }
-        }
-
-        if (!S.roomId) return null;
-
-        const d = await api(`/api/game/loto/room?id=${S.roomId}`, 'GET');
-        if (!d) return null;
-
-        S.bal = parseInt(d.meta?.user?.coin) || 0;
-        S.bots = d.playerCountBot || 0;
-        S.players = d.playerCountAll || 0;
-        S.status = d.room?.status ?? -1;
-
-        // Detect if I have a ticket
-        // hadTicket: chỉ set true nếu API trả về thông tin của mình (không phải bot cũ)
-        S.hadTicket = false;
-        if (d.playerInfo) {
-            const keys = Object.keys(d.playerInfo);
-            for (const k of keys) {
-                const info = d.playerInfo[k];
-                // Chỉ tính là có vé nếu is_bot === 0 (người thật)
-                if (info && info.is_bot === 0) {
-                    // Kiểm tra thêm user_id nếu có
-                    if (info.user_id || info.userId || info.id) {
-                        // So với user hiện tại - lấy từ cookie hoặc meta
-                    }
-                    S.hadTicket = true;
-                    break;
+            const m = location.href.match(/room\?id=(\d+)/);
+            if (m) S.roomId = m[1];
+            else {
+                const link = document.querySelector('a[href*="/game/loto/room?id="]');
+                if (link) {
+                    const m2 = link.href.match(/room\?id=(\d+)/);
+                    if (m2) S.roomId = m2[1];
                 }
             }
+            if (!S.roomId) return null;
         }
-        // Nếu playerInfo trống hoặc chỉ có bot -> hadTicket vẫn là false
-
+        const d = await api(`/api/game/loto/room?id=${S.roomId}`, 'GET');
+        if (!d) return null;
+        if (d.meta?.user?.coin) {
+            S.bal = parseInt(d.meta.user.coin.replace(/\./g, ''));
+            if (!S.initBal) S.initBal = S.bal;
+        }
+        S.status = parseInt(d.room?.status ?? -1);
+        S.bots = d.playerCountBot ?? 0;
+        if (d.ketquas?.userWin) S.ended = true;
         return d;
     }
 
     // ============================================================
-    // BET CALC
+    // CHIẾN THUẬT GẤP THẾP (tính toán dựa trên payout)
     // ============================================================
     function calcBet() {
-        const P = Math.max(S.players, 2);
-        const optimalX = P / (P - 1);
-        const effectiveX = Math.min(optimalX, CFG.MULTIPLIER);
+        // Số người chơi hiện tại
+        const players = (S.bots || 5) + 1;  // bots + mình
+        const payoutRatio = players;          // payout = players × bet
 
-        let bet;
-        if (S.streak <= 0) {
-            bet = CFG.BASE_BET;
-        } else {
-            bet = CFG.BASE_BET * Math.pow(effectiveX, S.streak);
-        }
-
-        bet = Math.max(bet, CFG.MIN_BET);
+        // Bet hiện tại dựa trên streak
+        let bet = CFG.BASE_BET * Math.pow(CFG.MULTIPLIER, S.streak);
+        bet = Math.round(bet);
         bet = Math.min(bet, CFG.MAX_BET);
+        bet = Math.max(bet, CFG.MIN_BET);
 
-        // Budget check
-        const maxBudget = S.bal * CFG.MAX_BALANCE_USAGE;
+        // Kiểm tra ngân sách: tổng tất cả bet trong chuỗi này
         let totalNeeded = 0;
         for (let i = 0; i <= S.streak; i++) {
-            totalNeeded += CFG.BASE_BET * Math.pow(effectiveX, i);
+            totalNeeded += CFG.BASE_BET * Math.pow(CFG.MULTIPLIER, i);
         }
-        if (totalNeeded > maxBudget) {
-            bet = Math.min(bet, maxBudget - (totalNeeded - bet));
+        totalNeeded = Math.round(totalNeeded);
+
+        const maxSpend = S.bal * CFG.MAX_BALANCE_USAGE;
+
+        if (totalNeeded > maxSpend) {
+            // Không đủ tiền cho bet tiếp theo → reset streak
+            log(`⚠️ Hết ngân sách cho chuỗi ${S.streak + 1} (cần ${fmt(totalNeeded)}, chỉ còn ${fmt(maxSpend)})`);
+            log(`🔄 RESET chuỗi thua về 0`);
+            S.streak = 0;
+            bet = CFG.BASE_BET;
+            bet = Math.min(bet, CFG.MAX_BET);
             bet = Math.max(bet, CFG.MIN_BET);
         }
 
-        return Math.floor(bet);
+        S.bet = bet;
+
+        // Tính lợi nhuận kỳ vọng
+        const winAmount = payoutRatio * bet;
+        const totalLossThisStreak = totalNeeded - bet; // tổng thua trước bet này
+        const netProfit = winAmount - bet - totalLossThisStreak;
+
+        log(`📐 Bet: ${fmt(bet)} | Streak: ${S.streak} | Players: ${players} | Payout: ${payoutRatio}:1`);
+        log(`   Nếu win: +${fmt(winAmount)} - ${fmt(bet)} vé - ${fmt(totalLossThisStreak)} streak`);
+        log(`   Lãi ròng: ${fmt(netProfit)}`);
+
+        return { bet, players, payoutRatio, totalNeeded, netProfit, winAmount };
     }
 
     // ============================================================
-    // GAME ACTIONS
+    // UI ACTIONS - Click nút trên trang
     // ============================================================
-    async function buyTicket() {
-        const r = await api('/api/game/loto/muave', 'POST', { id: S.roomId });
-        return r?.success;
-    }
-
-    async function addOneBot() {
-        const r = await api('/api/game/loto/muave/add_bot', 'POST', { id: S.roomId });
-        return r?.success;
-    }
-
-    async function setConfig(bet) {
-        const r = await api('/api/game/loto/setting', 'POST', {
-            id: S.roomId, type: CFG.GAME_TYPE, cuoc: bet
-        });
-        return r?.success;
-    }
-
-    async function startGame() {
-        const bet = calcBet();
-        const r = await api('/api/game/loto/start', 'POST', {
-            id: S.roomId, type: CFG.GAME_TYPE, cuoc: bet
-        });
-        if (r?.success) {
-            S.round++;
-            S.lastBet = bet;
-            S.startTime = S.startTime || Date.now();
-            S.action = '🎮 Đã bắt đầu ván mới!';
-            return true;
+    function clickText(text) {
+        for (const b of document.querySelectorAll('button')) {
+            if (b.textContent.trim() === text && !b.disabled) {
+                b.click();
+                log(`🖱️ "${text}"`);
+                return true;
+            }
         }
-        S.errorMsg = `⚠️ Start thất bại: ${r?.message || 'no response'}`;
         return false;
     }
 
-    async function resetGame() {
-        const r = await api('/api/game/loto/reset', 'POST', { id: S.roomId });
-        return r?.success;
-    }
-
-    // ============================================================
-    // GET RESULT
-    // ============================================================
-    function getResult(d) {
-        if (!d || !d.playerInfo) return null;
-        const keys = Object.keys(d.playerInfo);
-        for (const k of keys) {
-            const info = d.playerInfo[k];
-            if (info && info.is_bot === 0) return info;
-            if (k !== 'bot' && !String(k).includes('bot')) return info;
+    function clickContains(text) {
+        for (const b of document.querySelectorAll('button')) {
+            if (b.textContent.trim().includes(text) && !b.disabled) {
+                b.click();
+                log(`🖱️ "${b.textContent.trim()}"`);
+                return true;
+            }
         }
-        return null;
+        return false;
     }
 
-    // ============================================================
-    // SCANNER - Chạy mỗi 2s, đọc tình huống và quyết định hành động
-    // ============================================================
-    async function scanner() {
-        // Chỉ chạy khi không có lock
-        if (S.lock || !S.running) return;
-        S.lock = true;
-
-        try {
-            // 0. Xoá lỗi cũ đầu mỗi lượt quét
-            S.errorMsg = '';
-
-            // 1. Đọc tình huống từ DOM (luôn làm, không phụ thuộc API)
-            const dom = readGameDOM();
-            log('📡 DOM: ' + (['?','IDLE','PLAYING','ENDED'][dom.domStatus+1] || '?') + ' | ' + dom.debug);
-
-            // 2. Lưu trạng thái trước khi gọi API (tránh API ghi đè)
-            const prevStatus = S.status;
-            const prevProcessed = S.processedRound;
-
-            // 3. Đọc từ API
+    async function addBots() {
+        log('🤖 Thêm bot...');
+        let added = S.bots;
+        for (let i = 0; i < CFG.MAX_BOTS * 2; i++) {
+            if (added >= CFG.MAX_BOTS) break;
+            if (!S.roomId) break;
+            const r = await api('/api/game/loto/muave/add_bot', 'POST', { id: S.roomId });
+            if (r?.success) {
+                added++;
+                log(`  ✅ Bot ${added}/${CFG.MAX_BOTS}`);
+                await sleep(500);
+                continue;
+            }
+            // Maybe already have enough bots, refresh to check
             const d = await getRoom();
-            if (!d) {
-                // Fallback: dùng DOM để phán đoán nếu API lỗi
-                if (dom.domStatus >= 0) {
-                    S.status = dom.domStatus;
-                    S.action = '📡 Dùng DOM (API lỗi)...';
-                } else {
-                    S.action = '⏳ Đợi dữ liệu phòng...';
-                    S.lock = false; ui(); return;
-                }
-            }
-
-            // QUAN TRỌNG: Không để API ghi đè status nếu đã xử lý kết thúc
-            if (prevProcessed === 2 && prevStatus === 0) {
-                S.status = 0;
-                S.hadTicket = false;  // Reset luôn hadTicket vì API còn trả về dữ liệu cũ
-                log('🔄 Giữ status=0 và reset hadTicket (đã xử lý kết thúc)');
-            }
-            // Nếu DOM thấy idle nhưng API nói khác, tin DOM
-            if (dom.domStatus === 0 && S.status !== 0) {
-                log('📡 DOM thấy idle, ghi đè status=' + S.status + ' -> 0');
-                S.status = 0;
-                S.hadTicket = false;
-            }
-            // Nếu DOM thấy kết thúc nhưng API nói đang chơi, force refresh
-            if (dom.domStatus === 2 && S.status === 1) {
-                log('📡 DOM thấy kết quả, chờ API cập nhật...');
-                await sleep(500);
-                const d2 = await getRoom();
-                if (d2 && S.status === 2) {
-                    log('✅ API đã cập nhật sang ended');
-                }
-            }
-
-            const status = S.status;
-            log(`📊 Status=${status} hadTicket=${S.hadTicket} bots=${S.bots} dom=${dom.domStatus}`);
-
-            // 3. Xử lý theo tình huống
-            switch (status) {
-                // ============ IDLE ============
-                case 0: {
-                    await handleIdle(d, dom);
-                    break;
-                }
-
-                // ============ PLAYING ============
-                case 1: {
-                    await handlePlaying(d, dom);
-                    break;
-                }
-
-                // ============ ENDED ============
-                case 2: {
-                    await handleEnded(d, dom);
-                    break;
-                }
-
-                default: {
-                    S.action = `⏳ Trạng thái không xác định (API:${status} DOM:${dom.domStatus})`;
-                    break;
-                }
-            }
-
-        } catch(e) {
-            S.errorMsg = `❌ Lỗi: ${e.message}`;
-            log('❌ Scanner error:', e);
-        }
-
-        S.lock = false;
-        ui();
-    }
-
-    // ============================================================
-    // HANDLERS
-    // ============================================================
-    async function handleIdle(d, dom) {
-        S.action = '⏳ Phòng trống, chuẩn bị ván mới...';
-        S.processedRound = 0;
-
-        // Step 1: Mua vé (luôn thử nếu hadTicket = false)
-        // Nếu hadTicket = true nhưng API trả về cũ (từ ván trước), mua vé lại cũng ko sao
-        let hasTicket = S.hadTicket;
-        if (!hasTicket) {
-            S.action = '🎫 Mua vé...';
-            log('🎫 Mua vé...');
-            const ok = await buyTicket();
-            if (ok) {
-                log('✅ Đã mua vé');
-                S.hadTicket = true;
-                hasTicket = true;
-                await sleep(500);
-                // Refresh để cập nhật
-                await getRoom();
-            } else {
-                // Thử lại lần nữa
-                log('⚠️ Mua vé lần 1 thất bại, thử lại...');
-                await sleep(1000);
-                const ok2 = await buyTicket();
-                if (!ok2) {
-                    S.errorMsg = '⚠️ Mua vé thất bại!';
-                    return;
-                }
-                S.hadTicket = true;
-                hasTicket = true;
-                await sleep(500);
-                await getRoom();
-            }
-        } else {
-            log('⏩ Đã có vé, bỏ qua bước mua vé');
-        }
-
-        // Step 2: Thêm bot nếu cần
-        if (S.bots < CFG.MAX_BOTS) {
-            S.action = `🤖 Cần thêm bot (${S.bots}/${CFG.MAX_BOTS})...`;
-            const toAdd = Math.min(CFG.MAX_BOTS - S.bots, 3);
-            for (let i = 0; i < toAdd; i++) {
-                const ok = await addOneBot();
-                if (ok) {
-                    log(`✅ Thêm bot #${S.bots + i + 1}`);
-                    await sleep(600);
-                } else {
-                    log('⚠️ Thêm bot thất bại, dừng thêm');
-                    break;
-                }
-            }
-            await getRoom(); // refresh
-        }
-
-        // Step 3: Cần ít nhất bot hoặc người chơi khác
-        if (S.bots < 1 && S.players < 2) {
-            S.action = '⏳ Đợi người chơi hoặc bot...';
-            return;
-        }
-
-        // Step 4: Cấu hình cược
-        const bet = calcBet();
-        S.action = `⚙️ Cấu hình: ${fmt(bet)}...`;
-        const cfgOk = await setConfig(bet);
-        if (!cfgOk) {
-            S.errorMsg = '⚠️ Cấu hình thất bại!';
-            return;
-        }
-        await sleep(400);
-
-        // Step 5: Bắt đầu
-        S.action = '▶️ Bắt đầu...';
-        const started = await startGame();
-        if (started) {
-            S.processedRound = 1;
-            S.action = '🎮 Đã bắt đầu!';
-            log(`🎮 Ván #${S.round}, bet ${fmt(S.lastBet)}`);
-        } else {
-            S.errorMsg = '⚠️ Không thể bắt đầu ván';
-        }
-    }
-
-    async function handlePlaying(d, dom) {
-        S.action = '🎮 Đang chơi, chờ kết thúc...';
-
-        // Kiểm tra DOM: nếu thấy kết quả nhưng API chưa cập nhật, force refresh API
-        if (dom.domStatus === 2) {
-            log('📋 DOM thấy kết quả, force refresh API...');
+            if (d) added = d.playerCountBot || added;
+            if (added >= CFG.MAX_BOTS) break;
+            log(`  ⚠️ add_bot API fail, thử lại...`);
             await sleep(1000);
-            const d2 = await getRoom();
-            if (d2 && S.status === 2) {
-                // Nếu API đã cập nhật, qua handler ended
-                S.processedRound = 1;
-                return; // tick tiếp theo sẽ vào case 2
-            }
         }
+        S.bots = added;
+        log(`🤖 Bot: ${added}/${CFG.MAX_BOTS}`);
+        return added;
+    }
 
-        // Nếu có nút Start xuất hiện (ván kết thúc bất ngờ), xử lý luôn
-        if (dom.domStatus === 0 && dom.hasStartBtn) {
-            log('📋 DOM thấy nút Start - ván đã kết thúc, chuyển về idle');
-            S.status = 0;
-            S.hadTicket = false;
+    async function configureGame() {
+        log('⚙️ Cấu hình game...');
+        if (S.roomId) {
+            const r = await api('/api/game/loto/setting', 'POST', {
+                id: S.roomId, type: CFG.GAME_TYPE, cuoc: S.bet
+            });
+            if (r?.success) log('✅ Đã lưu cấu hình (API)');
+            else log('⚠️ Setting API không phản hồi');
         }
     }
 
-    async function handleEnded(d, dom) {
-        S.action = '🏁 Ván kết thúc, xử lý kết quả...';
+    async function startGame() {
+        const info = calcBet();
+        log(`▶️ Bắt đầu #${S.round+1}... vé ${fmt(S.bet)} | dư ${fmt(S.bal)}`);
 
-        // Chống xử lý trùng: nếu đã xử lý round này rồi thì bỏ qua
-        if (S.processedRound === 2) {
-            // Nếu DOM thấy idle, force về 0
-            if (dom.domStatus === 0 || dom.hasStartBtn) {
-                S.status = 0;
-                S.hadTicket = false;
-                S.processedRound = 0;
-                S.action = '⏳ DOM thấy idle, reset...';
-                log('🔄 DOM thấy idle, chuyển về trạng thái 0');
-            }
-            return;
+        if (!S.roomId) { log('❌ No room ID'); return false; }
+
+        const r = await api('/api/game/loto/start', 'POST', {
+            id: S.roomId, type: CFG.GAME_TYPE, cuoc: S.bet
+        });
+
+        if (r?.success) {
+            S.round++;
+            S.ended = false;
+            log(`✅ Game #${S.round} START!`);
+            ntf('🎮 Game #' + S.round, `Vé: ${fmt(S.bet)} | Lãi: +${fmt(info.netProfit)}`);
+            return true;
         }
-        S.processedRound = 2;
 
-        // Lấy kết quả
-        const result = getResult(d);
-        if (result) {
-            const prize = parseInt(result.prize) || 0;
-            const won = prize > 0;
-
-            if (won) {
-                S.wins++;
-                S.streak = 0;
-                S.profit += prize - S.lastBet;
-                log(`🎉 THẮNG! +${fmt(prize - S.lastBet)}`);
-                ntf('🎉 THẮNG', `+${fmt(prize - S.lastBet)}`);
-                S.action = '🎉 Thắng! Chuẩn bị reset...';
-            } else {
-                S.losses++;
-                S.streak++;
-                const loss = S.lastBet || calcBet();
-                S.profit -= loss;
-                log(`😞 THUA -${fmt(loss)} (streak: ${S.streak})`);
-                S.action = '😞 Thua! Gấp thếp...';
+        // Check error message
+        const errMsg = r?.message || '';
+        if (errMsg.includes('2 người chơi')) {
+            log('⚠️ Cần thêm người chơi - đang thêm bot...');
+            await addBots();
+            await sleep(1000);
+            // Retry
+            const r2 = await api('/api/game/loto/start', 'POST', {
+                id: S.roomId, type: CFG.GAME_TYPE, cuoc: S.bet
+            });
+            if (r2?.success) {
+                S.round++; S.ended = false;
+                log(`✅ Game #${S.round} START! (sau khi thêm bot)`);
+                ntf('🎮 Game #' + S.round, `Vé: ${fmt(S.bet)} | Lãi: +${fmt(info.netProfit)}`);
+                return true;
             }
+        }
+
+        log(`❌ Start failed: ${errMsg || 'unknown'}`);
+        return false;
+    }
+
+    async function continueGame() {
+        log('🔄 Reset phòng...');
+        if (!S.roomId) {
+            // Thu lay roomId tu DOM/URL
+            const m = location.href.match(/room\?id=(\d+)/);
+            if (m) S.roomId = m[1];
+            else {
+                const link = document.querySelector('a[href*="/game/loto/room?id="]');
+                if (link) {
+                    const m2 = link.href.match(/room\?id=(\d+)/);
+                    if (m2) S.roomId = m2[1];
+                }
+            }
+            if (!S.roomId) return false;
+        }
+        const r = await api('/api/game/loto/reset', 'POST', { id: S.roomId });
+        if (r?.success) {
+            log('✅ Đã reset phòng');
+            S.status = 0;
+            S.ended = false;
+            await sleep(500);
+            return true;
+        }
+        log('⚠️ Reset API fail, thử click nút "Tiếp tục"...');
+        const ok = await clickContains('Tiếp tục');
+        if (ok) {
+            S.status = 0;
+            S.ended = false;
+            await sleep(2000);
+            return true;
+        }
+        // Reset bang tay
+        S.status = 0;
+        S.ended = false;
+        return false;
+    }
+
+    // ============================================================
+    // KẾT QUẢ
+    // ============================================================
+    async function handleResult(d) {
+        const kq = d.ketquas;
+        if (!kq?.userWin) return false;
+
+        const winners = Array.isArray(kq.userWin) ? kq.userWin : [kq.userWin];
+        const prize = parseInt(kq.coinUserWin) || 0;
+        const myId = d.meta?.user?.id;
+        const won = winners.some(w => w.userId == myId);
+
+        const players = (S.bots || 5) + 1;
+
+        log(`🏁 GAME #${S.round}`);
+        log(`  👑 ${winners.map(w => w.account).join(', ')} thắng`);
+        log(`  💰 Giải: ${fmt(prize)} | Bet: ${fmt(S.bet)}`);
+
+        if (won) {
+            S.wins++;
+            const net = prize - S.bet;
+            S.profit += net;
+            // Tính lại lợi nhuận chuỗi
+            let totalLosses = 0;
+            for (let i = 0; i < S.streak; i++) {
+                totalLosses += CFG.BASE_BET * Math.pow(CFG.MULTIPLIER, i);
+            }
+            const streakNet = prize - S.bet - Math.round(totalLosses);
+            S.streak = 0;
+            log(`  🎉 BẠN THẮNG! +${fmt(net)} (lãi chuỗi: +${fmt(streakNet)})`);
+            log(`  📊 Streak reset → 0, bet về ${fmt(CFG.BASE_BET)}`);
+            ntf('🏆 THẮNG!', `+${fmt(net)} | Chuỗi: +${fmt(streakNet)}`);
         } else {
             S.losses++;
             S.streak++;
-            log('⚠️ Ko xđ kết quả, coi như thua');
+            S.profit -= S.bet;
+            log(`  😔 Thua -${fmt(S.bet)} (streak: ${S.streak})`);
+            const nextBet = CFG.BASE_BET * Math.pow(CFG.MULTIPLIER, S.streak);
+            log(`  🎯 Bet tiếp: ${fmt(nextBet)}`);
+            ntf('😔 Thua', `-${fmt(S.bet)} | Streak: ${S.streak}`);
         }
 
-        ui();
+        await getRoom();
 
-        // Auto restart
-        if (CFG.AUTO_RESTART && S.running) {
-            S.action = '🔄 Reset phòng...';
-            log('🔄 Reset phòng...');
-            const resetOk = await resetGame();
-            if (!resetOk) {
-                log('⚠️ Reset thất bại, thử lại...');
-                await sleep(2000);
-                await resetGame();
-            }
-            await sleep(1500);
+        // In tổng kết
+        log(`📊 T:${S.wins}/${S.round} | Lợi nhuận: ${fmt(S.profit)} | Dư: ${fmt(S.bal)}`);
 
-            // Refresh balance
-            const balD = await api('/api/home', 'GET');
-            if (balD?.meta?.user?.coin) {
-                S.bal = parseInt(balD.meta.user.coin);
-                log(`💰 Balance mới: ${fmt(S.bal)}`);
-            }
+        // Vẽ mini chart
+        const winRate = S.round > 0 ? (S.wins / S.round * 100).toFixed(1) : '-';
+        log(`📈 Tỉ lệ thắng: ${winRate}%`);
 
-            // QUAN TRỌNG: Reset state để vòng mới bắt đầu
-            S.status = 0;
-            S.hadTicket = false;
-            S.processedRound = 0;
-            S.action = '⏳ Sẵn sàng ván mới (đã reset)';
-            log('🔄 Đã reset, sẵn sàng ván mới');
-
-            // Kiểm tra thêm từ DOM
-            const dom2 = readGameDOM();
-            if (dom2.domStatus === 0) {
-                log('📡 DOM xác nhận idle');
-            }
-        }
+        S.processedRound = 2;
+        return true;
     }
 
     // ============================================================
-    // TOGGLE
+    // MAIN LOOP
     // ============================================================
-    function toggle() {
-        S.running = !S.running;
-        if (S.running) {
-            log('▶️ Bật auto loto');
-            S.errorMsg = '';
-            S.startTime = S.startTime || Date.now();
-            S.action = '⏳ Quét tình huống...';
-            // Xoá interval cũ nếu có
-            if (S.scannerId) { clearInterval(S.scannerId); }
-            // Chạy ngay 1 lần
-            scanner();
-            // Chạy định kỳ
-            S.scannerId = setInterval(scanner, CFG.SCAN_MS);
-            log(`📡 Scanner bắt đầu (${CFG.SCAN_MS}ms)`);
-        } else {
-            log('⏸ Tắt auto loto');
-            if (S.scannerId) { clearInterval(S.scannerId); S.scannerId = null; }
-            S.action = '⏸ Đã dừng';
-            ntf('⏸', 'Auto Loto đã tạm dừng');
+    async function loop() {
+        if (S.busy) return;
+        S.busy = true;
+
+        try {
+            // 0. Doc DOM de kiem tra tinh huong
+            const dom = readGameDOM();
+
+            // 1. Doc API
+            const d = await getRoom();
+            if (!d) {
+                // Fallback dung DOM neu API loi
+                if (dom.status >= 0) {
+                    S.status = dom.status;
+                    S.action = '📡 DOM: ' + ['Chờ','Chơi','Xong'][dom.status] || '?';
+                    S.busy = false; ui(); return;
+                }
+                S.action = '⏳ Chờ phòng...';
+                await sleep(CFG.POLL_INTERVAL);
+                return;
+            }
+            ui();
+
+            // Chống kẹt: nếu đã xử lý kết thúc, giữ status=0 ko để API ghi đè
+            const st = S.processedRound === 2 ? 0 : S.status;
+
+            // Neu DOM thay idle nhung API noi khac, tin DOM
+            const effectiveSt = (dom.status === 0 && st !== 0) ? 0 : st;
+
+            if (effectiveSt !== S.status) {
+                log(`📡 DOM chuyen status ${S.status} -> ${effectiveSt}`);
+                S.status = effectiveSt;
+            }
+
+            // === STATUS 2: Game ended ===
+            if (S.status === 2) {
+                S.action = '🏁 Kết thúc';
+
+                // Chi xu ly neu chua xu ly round nay
+                if (S.processedRound !== 2 && d.ketquas?.userWin) {
+                    await handleResult(d);
+                }
+
+                if (CFG.AUTO_RESTART) {
+                    await continueGame();
+                    S.processedRound = 2;
+                    await sleep(500);
+                    // Reset processedRound cho vong moi
+                    S.status = 0;
+                    S.processedRound = 0;
+                    S.action = '🔄 Sẵn sàng ván mới';
+                    // Refresh balance
+                    const d2 = await api('/api/home', 'GET');
+                    if (d2?.meta?.user?.coin) {
+                        S.bal = parseInt(d2.meta.user.coin.replace(/\./g, ''));
+                    }
+                }
+                return;
+            }
+
+            // === STATUS 1: Playing ===
+            if (S.status === 1) {
+                S.action = '🎮 Theo dõi...';
+
+                // Kiem tra DOM: neu thay ket qua, cho API cap nhat
+                if (dom.status === 2) {
+                    log('📡 DOM thay ket qua, refresh API...');
+                    await sleep(1000);
+                    const d2 = await getRoom();
+                    if (d2) {
+                        if (S.status === 2) {
+                            S.processedRound = 1; // danh dau de vong sau xu ly
+                        }
+                        // Neu S.status van la 1 ma DOM bao xong, tu chuyen
+                        if (S.status === 1 && dom.status === 0) {
+                            log('📡 DOM thay start button, chuyen sang idle');
+                            S.status = 0;
+                            S.action = '⏸ Chuyển sang idle';
+                        }
+                    }
+                }
+
+                if (d.ketquas?.userWin && S.processedRound !== 2) {
+                    await handleResult(d);
+                    if (CFG.AUTO_RESTART) {
+                        await continueGame();
+                        S.processedRound = 2;
+                        S.status = 0;
+                        S.processedRound = 0;
+                    }
+                    return;
+                }
+                const kq = d.ketquas;
+                if (kq) {
+                    const drawn = kq.data?.length || 0;
+                    S.action = `🎯 ${drawn} số`;
+                }
+                return;
+            }
+
+            // === STATUS 0: Idle ===
+            if (S.status === 0) {
+                S.action = '⏸ Phòng trống';
+                S.processedRound = 0;
+
+                // Check if we have ticket already
+                const uid = d.meta?.user?.id;
+                const hasTicket = d.playerInfo && d.playerInfo[String(uid)];
+
+                // Nếu chưa có vé: cấu hình → thêm bot → mua vé + start
+                if (!hasTicket) {
+                    S.action = '🎫 Chuẩn bị...';
+                    calcBet();
+                    await configureGame();
+                    await sleep(CFG.DELAY);
+                    await addBots();
+                    await sleep(CFG.DELAY);
+                    await startGame();
+                } else {
+                    // Có vé rồi: chỉ thêm bot + start
+                    S.action = '🤖 Thêm bot...';
+                    if (d.playerCountBot < CFG.MAX_BOTS) {
+                        await addBots();
+                        await sleep(CFG.DELAY);
+                    }
+                    await startGame();
+                }
+                return;
+            }
+
+            S.action = `⚠️ Lạ: ${S.status}`;
+
+        } catch (e) {
+            log('❌', e.message);
+            S.action = '❌ ' + e.message;
+        } finally {
+            S.busy = false;
+            ui();
         }
-        ui();
     }
 
     // ============================================================
     // UI
     // ============================================================
-    function statusText(s) {
-        return ['⏳ Chờ', '🎮 Đang chơi', '🏁 Kết thúc'][s] || `❓(${s})`;
+    function createUI() {
+        if (document.getElementById('loto-ui')) return;
+        const el = document.createElement('div');
+        el.id = 'loto-ui';
+        el.innerHTML = `
+<div style="position:fixed;bottom:10px;right:10px;z-index:99999;
+background:linear-gradient(135deg,#1a1a2e,#16213e);
+border:2px solid #e94560;border-radius:12px;padding:14px;
+color:#fff;font-family:Segoe UI,Arial,sans-serif;font-size:13px;
+min-width:300px;box-shadow:0 8px 32px rgba(0,0,0,.5);
+max-height:90vh;overflow-y:auto;">
+<div style="display:flex;justify-content:space-between;align-items:center;
+margin-bottom:10px;border-bottom:1px solid #e94560;padding-bottom:8px;">
+<div style="font-weight:bold;font-size:15px;color:#e94560;">🎰 Loto Martingale
+<button id="lt-config-btn" title="Cài đặt" style="background:transparent;color:#888;border:none;cursor:pointer;font-size:16px;margin-left:4px;">⚙️</button>
+</div>
+<div>
+<button id="lt-toggle" style="background:#4CAF50;color:#fff;border:none;
+padding:5px 14px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px;">▶ CHẠY</button>
+<button id="lt-close" style="background:transparent;color:#999;border:1px solid #555;
+padding:5px 8px;border-radius:6px;cursor:pointer;margin-left:4px;font-size:12px;">✕</button>
+</div></div>
+<table style="width:100%;font-size:12px;">
+<tr><td>💰 Dư</td><td id="lt-bal" style="color:#4CAF50;font-weight:bold;text-align:right;">0</td></tr>
+<tr><td>🎫 Bet</td><td id="lt-bet" style="color:#FFC107;font-weight:bold;text-align:right;">0</td></tr>
+<tr><td>📈 Nhân</td><td id="lt-mul" style="text-align:right;">x${CFG.MULTIPLIER}</td></tr>
+<tr><td>🏆 Lãi</td><td id="lt-profit" style="font-weight:bold;text-align:right;">0</td></tr>
+<tr><td>📊 Tỉ lệ</td><td id="lt-stats" style="text-align:right;">0/0 (0%)</td></tr>
+<tr><td>🔥 Streak</td><td id="lt-streak" style="color:#FF9800;font-weight:bold;text-align:right;">0</td></tr>
+<tr><td>🤖 Bot</td><td id="lt-bots" style="color:#64B5F6;text-align:right;">0/5</td></tr>
+<tr><td>📌</td><td id="lt-status" style="color:#FF9800;text-align:right;">Đang tải...</td></tr>
+<tr><td>🔄</td><td id="lt-action" style="color:#90CAF9;font-size:11px;text-align:right;">-</td></tr>
+</table>
+<div style="margin-top:8px;padding-top:6px;border-top:1px solid #333;font-size:11px;color:#888;">
+<span id="lt-timer">00:00</span>
+<button id="lt-reset" style="background:transparent;border:1px solid #555;color:#888;
+padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;float:right;">🔄 Reset</button>
+</div></div>`;
+        document.body.appendChild(el);
+        document.getElementById('lt-toggle').onclick = toggle;
+        document.getElementById('lt-close').onclick = () => el.style.display = 'none';
+        document.getElementById('lt-config-btn').onclick = showConfig;
+        document.getElementById('lt-reset').onclick = () => {
+            S.wins = S.losses = S.round = S.profit = S.streak = 0;
+            S.initBal = S.bal;
+            ui();
+        };
+        ui();
     }
 
-    function createUI() {
-        if ($('lt-panel')) return;
 
-        const panel = document.createElement('div');
-        panel.id = 'lt-panel';
-        panel.style.cssText = `
-            position:fixed; top:10px; right:10px; z-index:999999;
-            background:#1a1a2e; color:#eee; border:2px solid #e94560;
-            border-radius:10px; padding:12px; width:280px;
-            font-family:monospace; font-size:12px; box-shadow:0 4px 20px rgba(0,0,0,0.5);
+    // ============================================================
+    // CONFIG UI
+    // ============================================================
+    function loadConfig() {
+        try {
+            const saved = GM_getValue('loto_config', '{}');
+            const cfg = JSON.parse(saved);
+            if (cfg.BASE_BET) CFG.BASE_BET = cfg.BASE_BET;
+            if (cfg.MULTIPLIER) CFG.MULTIPLIER = cfg.MULTIPLIER;
+            if (cfg.MAX_BOTS) CFG.MAX_BOTS = cfg.MAX_BOTS;
+            if (cfg.GAME_TYPE) CFG.GAME_TYPE = cfg.GAME_TYPE;
+            if (cfg.MAX_BET) CFG.MAX_BET = cfg.MAX_BET;
+            if (cfg.MIN_BET) CFG.MIN_BET = cfg.MIN_BET;
+            if (cfg.MAX_BALANCE_USAGE) CFG.MAX_BALANCE_USAGE = cfg.MAX_BALANCE_USAGE;
+            log('⚙️ Đã tải cấu hình từ storage');
+        } catch(e) {}
+    }
+
+    function saveConfig() {
+        const cfg = {
+            BASE_BET: CFG.BASE_BET,
+            MULTIPLIER: CFG.MULTIPLIER,
+            MAX_BOTS: CFG.MAX_BOTS,
+            GAME_TYPE: CFG.GAME_TYPE,
+            MAX_BET: CFG.MAX_BET,
+            MIN_BET: CFG.MIN_BET,
+            MAX_BALANCE_USAGE: CFG.MAX_BALANCE_USAGE,
+        };
+        GM_setValue('loto_config', JSON.stringify(cfg));
+        log('⚙️ Đã lưu cấu hình');
+    }
+
+    function showConfig() {
+        // Remove old modal if exists
+        const old = document.getElementById('lt-config-modal');
+        if (old) old.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'lt-config-modal';
+        overlay.style.cssText = `
+            position:fixed;top:0;left:0;width:100%;height:100%;
+            background:rgba(0,0,0,0.6);z-index:999999;
+            display:flex;justify-content:center;align-items:center;
+            font-family:Segoe UI,Arial,sans-serif;
         `;
+        overlay.innerHTML = `
+<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
+border:2px solid #e94560;border-radius:14px;padding:20px;
+color:#fff;min-width:360px;max-width:420px;
+box-shadow:0 8px 40px rgba(0,0,0,.6);">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid #e94560;padding-bottom:10px;">
+<div style="font-size:16px;font-weight:bold;color:#e94560;">⚙️ Cài đặt</div>
+<button id="lt-modal-close" style="background:transparent;color:#999;border:1px solid #555;border-radius:6px;cursor:pointer;padding:4px 10px;font-size:14px;">✕</button>
+</div>
+<table style="width:100%;font-size:13px;border-collapse:collapse;">
+<tr><td style="padding:5px 0;">🎫 Bet cơ bản</td>
+<td style="text-align:right;"><input id="cfg-basebet" type="number" value="${CFG.BASE_BET}" style="width:130px;background:#0f0f23;border:1px solid #333;color:#fff;border-radius:4px;padding:4px 8px;text-align:right;font-size:13px;"></td></tr>
+<tr><td style="padding:5px 0;">📈 Hệ số nhân (X)</td>
+<td style="text-align:right;"><input id="cfg-multiplier" type="number" step="0.01" value="${CFG.MULTIPLIER}" style="width:130px;background:#0f0f23;border:1px solid #333;color:#fff;border-radius:4px;padding:4px 8px;text-align:right;font-size:13px;"></td></tr>
+<tr><td style="padding:5px 0;">🤖 Số bot tối đa</td>
+<td style="text-align:right;"><input id="cfg-bots" type="number" min="0" max="5" value="${CFG.MAX_BOTS}" style="width:130px;background:#0f0f23;border:1px solid #333;color:#fff;border-radius:4px;padding:4px 8px;text-align:right;font-size:13px;"></td></tr>
+<tr><td style="padding:5px 0;">🔢 Loại số</td>
+<td style="text-align:right;">
+<select id="cfg-gametype" style="width:130px;background:#0f0f23;border:1px solid #333;color:#fff;border-radius:4px;padding:4px 8px;font-size:13px;">
+<option value="1" ${CFG.GAME_TYPE===1?'selected':''}>50 Số</option>
+<option value="2" ${CFG.GAME_TYPE===2?'selected':''}>90 Số</option>
+</select></td></tr>
+<tr><td style="padding:5px 0;">💰 Giới hạn vé tối đa</td>
+<td style="text-align:right;"><input id="cfg-maxbet" type="number" value="${CFG.MAX_BET}" style="width:130px;background:#0f0f23;border:1px solid #333;color:#fff;border-radius:4px;padding:4px 8px;text-align:right;font-size:13px;"></td></tr>
+<tr><td style="padding:5px 0;">🪙 Giới hạn vé tối thiểu</td>
+<td style="text-align:right;"><input id="cfg-minbet" type="number" value="${CFG.MIN_BET}" style="width:130px;background:#0f0f23;border:1px solid #333;color:#fff;border-radius:4px;padding:4px 8px;text-align:right;font-size:13px;"></td></tr>
+<tr><td style="padding:5px 0;">💳 Dùng tối đa % dư</td>
+<td style="text-align:right;"><input id="cfg-balusg" type="number" min="0" max="1" step="0.05" value="${CFG.MAX_BALANCE_USAGE}" style="width:130px;background:#0f0f23;border:1px solid #333;color:#fff;border-radius:4px;padding:4px 8px;text-align:right;font-size:13px;"></td></tr>
+</table>
+<div style="margin-top:14px;padding-top:10px;border-top:1px solid #333;font-size:12px;color:#888;">
+<div>💡 X = ${CFG.MULTIPLIER} → với 6 người: lãi luôn = bet × 5</div>
+<div>⚠️ X phải &lt; P/(P-1) để có lãi. P=6 → X&lt;1.2</div>
+</div>
+<div style="display:flex;gap:8px;margin-top:12px;">
+<button id="cfg-save" style="flex:1;background:#e94560;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;font-weight:bold;">💾 Lưu & Đóng</button>
+<button id="cfg-close" style="flex:1;background:#333;color:#888;border:1px solid #555;border-radius:6px;padding:8px;cursor:pointer;">Hủy</button>
+</div>
+</div>`;
+        document.body.appendChild(overlay);
 
-        panel.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <b style="color:#e94560; font-size:14px;">🎰 LOTO AUTO</b>
-                <button id="lt-close-btn" style="background:none; border:none; color:#888; cursor:pointer; font-size:16px;">✕</button>
-            </div>
-            <div style="background:#16213e; border-radius:6px; padding:8px; margin-bottom:6px;">
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Phòng:</span>
-                    <b id="lt-room-id">-</b>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Trạng thái:</span>
-                    <b id="lt-status">⏳ Đang tải...</b>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Hành động:</span>
-                    <b id="lt-action" style="color:#4fc3f7;">-</b>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Dư:</span>
-                    <b id="lt-bal" style="color:#ffd700;">0</b>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Bot / Người:</span>
-                    <b id="lt-players">0 / 0</b>
-                </div>
-                <hr style="border-color:#333; margin:4px 0;">
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Ván (T/L):</span>
-                    <b id="lt-round">0 (0/0)</b>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Liên tiếp:</span>
-                    <b id="lt-streak" style="color:#ff6b6b;">0</b>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Lãi:</span>
-                    <b id="lt-profit" style="color:#4CAF50;">0</b>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span>Bet hiện tại:</span>
-                    <b id="lt-bet" style="color:#ffd700;">0</b>
-                </div>
-            </div>
-            <div id="lt-error" style="background:#5c1a1a; border-radius:4px; padding:4px 8px; margin-bottom:4px; color:#ff6b6b; display:none;"></div>
-            <div style="display:flex; gap:4px;">
-                <button id="lt-toggle-btn" style="flex:1; background:#4CAF50; color:white; border:none; border-radius:4px; padding:6px; cursor:pointer; font-weight:bold;">▶ CHẠY</button>
-                <button id="lt-config-btn" style="background:#2196F3; color:white; border:none; border-radius:4px; padding:6px; cursor:pointer; font-size:11px;">⚙️ Config</button>
-            </div>
-            <div id="lt-config" style="display:none; margin-top:6px; background:#16213e; border-radius:6px; padding:8px;">
-                <div style="margin-bottom:4px;">
-                    <small>ID Phòng:</small>
-                    <input id="lt-room-input" type="text" style="width:100%; background:#0f3460; color:white; border:1px solid #333; border-radius:3px; padding:2px 4px; font-size:11px;" placeholder="Nhập ID phòng">
-                </div>
-                <div style="margin-bottom:4px;">
-                    <small>Bet cơ bản:</small>
-                    <input id="lt-bet-input" type="number" style="width:100%; background:#0f3460; color:white; border:1px solid #333; border-radius:3px; padding:2px 4px; font-size:11px;" value="${CFG.BASE_BET}">
-                </div>
-                <div style="margin-bottom:4px;">
-                    <small>Multiplier:</small>
-                    <input id="lt-mult-input" type="number" step="0.001" style="width:100%; background:#0f3460; color:white; border:1px solid #333; border-radius:3px; padding:2px 4px; font-size:11px;" value="${CFG.MULTIPLIER}">
-                </div>
-                <button id="lt-force-btn" style="width:100%; background:#e94560; color:white; border:none; border-radius:4px; padding:4px; cursor:pointer; font-size:11px; margin-top:4px;">💪 Force Start (ID hiện tại)</button>
-            </div>
-        `;
+        document.getElementById('lt-modal-close').onclick = () => overlay.remove();
+        document.getElementById('cfg-close').onclick = () => overlay.remove();
 
-        document.body.appendChild(panel);
+        document.getElementById('cfg-save').onclick = () => {
+            const basebet = parseInt(document.getElementById('cfg-basebet').value) || CFG.BASE_BET;
+            const mult = parseFloat(document.getElementById('cfg-multiplier').value) || CFG.MULTIPLIER;
+            const bots = parseInt(document.getElementById('cfg-bots').value) || CFG.MAX_BOTS;
+            const gametype = parseInt(document.getElementById('cfg-gametype').value) || CFG.GAME_TYPE;
+            const maxbet = parseInt(document.getElementById('cfg-maxbet').value) || CFG.MAX_BET;
+            const minbet = parseInt(document.getElementById('cfg-minbet').value) || CFG.MIN_BET;
+            const balusg = parseFloat(document.getElementById('cfg-balusg').value) || CFG.MAX_BALANCE_USAGE;
 
-        // Event handlers
-        $('lt-close-btn').onclick = () => { panel.style.display = 'none'; };
-        $('lt-toggle-btn').onclick = toggle;
-        $('lt-config-btn').onclick = () => {
-            const cfg = $('lt-config');
-            cfg.style.display = cfg.style.display === 'none' ? 'block' : 'none';
-        };
-        $('lt-force-btn').onclick = () => {
-            const rid = $('lt-room-input').value.trim();
-            if (rid) {
-                S.roomId = rid;
-                log(`📌 Force room ID: ${rid}`);
-                $('lt-config').style.display = 'none';
-                S.errorMsg = '';
-                if (!S.running) toggle();
-            }
-        };
-        $('lt-bet-input').onchange = (e) => {
-            const v = parseInt(e.target.value);
-            if (v > 0) CFG.BASE_BET = v;
-        };
-        $('lt-mult-input').onchange = (e) => {
-            const v = parseFloat(e.target.value);
-            if (v > 1) CFG.MULTIPLIER = v;
+            CFG.BASE_BET = Math.max(1000000, Math.min(1000000000, basebet));
+            CFG.MULTIPLIER = Math.max(1.01, Math.min(2.0, mult));
+            CFG.MAX_BOTS = Math.max(0, Math.min(5, bots));
+            CFG.GAME_TYPE = gametype === 2 ? 2 : 1;
+            CFG.MAX_BET = Math.max(CFG.MIN_BET, Math.min(1000000000, maxbet));
+            CFG.MIN_BET = Math.max(1000000, Math.min(CFG.MAX_BET, minbet));
+            CFG.MAX_BALANCE_USAGE = Math.max(0.1, Math.min(0.95, balusg));
+
+            saveConfig();
+            log(`⚙️ Cấu hình mới: base=${CFG.BASE_BET} mult=${CFG.MULTIPLIER} bots=${CFG.MAX_BOTS} type=${CFG.GAME_TYPE}`);
+            overlay.remove();
+            ui();
         };
     }
 
     function ui() {
-        if (!$('lt-panel')) return;
-        const st = S.status;
-        $('lt-room-id').textContent = S.roomId || '-';
-        $('lt-status').textContent = st >= 0 ? statusText(st) : '⏳ Đang tải...';
-        $('lt-action').textContent = S.action || '-';
+        const $ = id => document.getElementById(id);
+        if (!$('lt-bal')) return;
         $('lt-bal').textContent = fmt(S.bal);
-        $('lt-players').textContent = `${S.bots} / ${S.players}`;
-        $('lt-round').textContent = `${S.round} (${S.wins}/${S.losses})`;
+        $('lt-bet').textContent = fmt(S.bet);
+        const p = $('lt-profit');
+        p.textContent = (S.profit >= 0 ? '+' : '') + fmt(Math.abs(S.profit));
+        p.style.color = S.profit >= 0 ? '#4CAF50' : '#f44336';
+        const wr = S.round > 0 ? (S.wins / S.round * 100).toFixed(1) + '%' : '0%';
+        $('lt-stats').textContent = `${S.wins}/${S.round} (${wr})`;
         $('lt-streak').textContent = S.streak;
-        const profitColor = S.profit >= 0 ? '#4CAF50' : '#ff6b6b';
-        $('lt-profit').textContent = fmt(S.profit);
-        $('lt-profit').style.color = profitColor;
-        $('lt-bet').textContent = fmt(S.lastBet || calcBet());
-
-        const tb = $('lt-toggle-btn');
+        $('lt-bots').textContent = `${S.bots}/5`;
+        const st = {'-1':'⏳','0':'⏸','1':'🎮','2':'🏁'};
+        $('lt-status').textContent = st[S.status] || '❓';
+        $('lt-action').textContent = S.action;
+        if (S.startTime) {
+            const sec = Math.floor((Date.now() - S.startTime) / 1000);
+            $('lt-timer').textContent =
+                String(Math.floor(sec / 60)).padStart(2, '0') + ':' +
+                String(sec % 60).padStart(2, '0');
+        }
+        const tb = $('lt-toggle');
         if (tb) {
             tb.textContent = S.running ? '⏸ DỪNG' : '▶ CHẠY';
             tb.style.background = S.running ? '#e94560' : '#4CAF50';
         }
-
-        const errEl = $('lt-error');
-        if (errEl) {
-            if (S.errorMsg) {
-                errEl.textContent = S.errorMsg;
-                errEl.style.display = 'block';
-            } else {
-                errEl.style.display = 'none';
-            }
-        }
     }
 
     // ============================================================
-    // WATCH URL CHANGES
+    // CONTROL
     // ============================================================
-    let lastUrl = location.href;
-    new MutationObserver(() => {
-        const url = location.href;
-        if (url !== lastUrl) {
-            lastUrl = url;
-            if (url.includes('/game/loto') || url.includes('/loto')) {
-                log('🔄 Phát hiện vào phòng loto');
-                S.roomId = null; // reset để auto-detect lại
-                // Nếu đang chạy thì scanner sẽ tự phát hiện
-                if (!S.running && S.initDone) {
-                    setTimeout(() => { if (!S.running) toggle(); }, 2000);
-                }
-            }
+    let iv = null;
+
+    function toggle() {
+        S.running = !S.running;
+        log(S.running ? '▶️ BẬT' : '⏸️ TẮT');
+        if (S.running) {
+            S.startTime = Date.now();
+            iv = setInterval(loop, CFG.POLL_INTERVAL);
+            loop();
+            ntf('▶️ Auto-Play', 'Đã bắt đầu!');
+        } else {
+            if (iv) { clearInterval(iv); iv = null; }
+            S.action = '⏸ Đã dừng';
+            ntf('⏸️', 'Đã tạm dừng.');
         }
-    }).observe(document, { subtree: true, childList: true });
+        ui();
+    }
 
     // ============================================================
     // INIT
     // ============================================================
     async function init() {
-        log('🚀 Gaubong Loto Scanner v3.0.0');
+        log('🚀 Loto Martingale v2.1.1');
+
+        // Tính payout tối thiểu
+        const minPayout = 6; // mình + 5 bot
+        const maxMul = minPayout / (minPayout - 1);
+        log(`📐 Payout tối thiểu: ${minPayout}:1`);
+        log(`📐 Multiplier tối đa cho P=${minPayout}: x${maxMul.toFixed(4)}`);
+        log(`📐 Multiplier đang dùng: x${CFG.MULTIPLIER} (an toàn)`);
+
+        // Verify
+        if (CFG.MULTIPLIER >= maxMul) {
+            log(`⚠️ CẢNH BÁO: Multiplier ${CFG.MULTIPLIER} >= ${maxMul.toFixed(4)}`);
+            log(`⚠️ Có thể không có lãi nếu thua nhiều ván!`);
+            log(`ℹ️ Giảm MULTIPLIER xuống dưới ${maxMul.toFixed(4)}`);
+        } else {
+            log(`✅ Multiplier ${CFG.MULTIPLIER} < ${maxMul.toFixed(4)} → luôn có lãi ✓`);
+        }
+
+        // Lấy thông tin phòng
+        const d = await getRoom();
+        if (!d) {
+            log('❌ Không vào được phòng. Đăng nhập + vào game/loto/room trước.');
+            loadConfig();
+        createUI();
+            return;
+        }
+
+        log(`✅ Phòng #${S.roomId}`);
+        log(`💰 Dư: ${fmt(S.bal)} | Bet base: ${fmt(CFG.BASE_BET)}`);
+
+        loadConfig();
         createUI();
 
-        // Thử lấy phòng
-        const d = await getRoom();
-        if (d) {
-            log(`✅ Phòng #${S.roomId} | Bal: ${fmt(S.bal)} | Bot: ${S.bots} | Người: ${S.players} | Status: ${S.status}`);
-
-            // Tính toán multiplier tối ưu
-            const P = Math.max(S.players, 2);
-            const optimalX = P / (P - 1);
-            log(`📐 P=${P}, Multiplier tối ưu: x${optimalX.toFixed(4)}`);
-
-            // Dự tính ngân sách
-            log('════════ DỰ TÍNH CHUỖI THUA ════════');
-            const budget = S.bal * CFG.MAX_BALANCE_USAGE;
-            let total = 0;
-            const effectiveX = Math.min(CFG.MULTIPLIER, optimalX);
-            for (let i = 0; i < 15; i++) {
-                const bet = CFG.BASE_BET * Math.pow(effectiveX, i);
-                total += bet;
-                const win = bet * P;
-                const net = win - total;
-                log(`  Ván ${i+1}: bet ${fmt(bet)} | lũy kế ${fmt(total)} | lãi +${fmt(net)} ${total <= budget ? '✅' : '❌'}`);
-                if (total > budget && i > 3) break;
+        // Dự tính
+        log('');
+        log('════════ DỰ TÍNH CHUỖI THUA ════════');
+        let bal = S.bal * CFG.MAX_BALANCE_USAGE;
+        log(`  Ngân sách: ${fmt(bal)} (${CFG.MAX_BALANCE_USAGE*100}% của ${fmt(S.bal)})`);
+        let total = 0;
+        for (let i = 0; i < 15; i++) {
+            const bet = CFG.BASE_BET * Math.pow(CFG.MULTIPLIER, i);
+            total += bet;
+            const win = 6 * bet;
+            const net = win - bet - (total - bet);
+            const enough = total <= bal;
+            log(`  Ván ${i+1}: bet ${fmt(bet)} | lũy kế ${fmt(total)} | win ${fmt(win)} | lãi +${fmt(net)} ${enough ? '✅' : '❌'}`);
+            if (!enough && i > 3) {
+                log(`  ... hết ngân sách ở ván ${i+2}`);
+                log(`  => Có thể chịu ${i} ván thua liên tiếp`);
+                break;
             }
-
-            // Phát hiện trạng thái
-            if (S.status === 1) {
-                S.action = '🎮 Giữa vòng, chờ kết thúc...';
-            } else if (S.status === 2) {
-                S.action = '🏁 Ván kết thúc, sẵn sàng...';
-            } else {
-                S.action = '⏳ Sẵn sàng bắt đầu...';
-            }
-        } else {
-            S.action = '⌨️ Đợi vào phòng loto...';
-            log('⚠️ Chưa tìm thấy phòng loto. Vào phòng và bật auto.');
         }
+        log('═════════════════════════════════════');
+        log('');
+        log('⏳ Tự bật sau 3s...');
 
-        S.initDone = true;
+        setTimeout(() => { if (!S.running) toggle(); }, 3000);
         ui();
-
-        // Auto-start nếu tìm thấy phòng
-        if (S.roomId) {
-            log('⏳ Tự động bật sau 2s...');
-            await sleep(2000);
-            if (!S.running) toggle();
-        }
     }
 
-    // ============================================================
-    // START
-    // ============================================================
     if (document.readyState === 'loading')
         document.addEventListener('DOMContentLoaded', init);
     else
         init();
 
-    log('📜 Loaded v3.1.0');
+    log('📜 Loaded!');
 })();
