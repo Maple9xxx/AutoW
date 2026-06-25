@@ -61,6 +61,9 @@
         running: false,
         roomId: null,
         status: -1,
+        stuckTicks: 0,      // dem so tick ko doi trang thai
+        _lastStatus: -2,    // status lan truoc de so sanh
+        _lastStatusTime: 0,
         bal: 0,
         initBal: 0,
         bet: CFG.BASE_BET,
@@ -186,7 +189,8 @@
         }
         S.status = parseInt(d.room?.status ?? -1);
         S.bots = d.playerCountBot ?? 0;
-        if (d.ketquas?.userWin) S.ended = true;
+        // KHONG set S.ended o day - de loop handler decide
+        // Neu set som, loop se bo qua handleResult vi !S.ended = false
         return d;
     }
 
@@ -465,6 +469,7 @@
         log(`📈 Tỉ lệ thắng: ${winRate}%`);
 
         S.processedRound = 2;
+        S.ended = true;
         return true;
     }
 
@@ -529,6 +534,22 @@
                 effectiveSt = dom.status;
                 S.status = dom.status;
                 log(`📡 Dung DOM de xac dinh trang thai: ${dom.status}`);
+            }
+
+            // PHAT HIEN KET: neu o 1 trang thai qua lau, force refresh
+            if (S.status !== S._lastStatus) {
+                S.stuckTicks = 0;
+                S._lastStatus = S.status;
+                S._lastStatusTime = Date.now();
+            } else {
+                S.stuckTicks++;
+            }
+            if (S.stuckTicks > 6 && S.status >= 0) {  // > 120s cung 1 trang thai
+                log('⚠️ KET qua lau (' + S.stuckTicks + ' ticks), reload page...');
+                // Save state before reload
+                try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
+                location.reload();
+                return;
             }
 
             // === STATUS 2: Game ended ===
@@ -887,7 +908,19 @@ box-shadow:0 8px 40px rgba(0,0,0,.6);">
         const d = await getRoom();
         if (!d) {
             log('❌ Không vào được phòng. Đăng nhập + vào game/loto/room trước.');
-            loadConfig();
+            // Khoi phuc state neu co
+        try {
+            const saved = GM_getValue('loto_session', '{}');
+            const sess = JSON.parse(saved);
+            if (sess.streak) S.streak = sess.streak;
+            if (sess.profit) S.profit = sess.profit;
+            if (sess.wins) S.wins = sess.wins;
+            if (sess.losses) S.losses = sess.losses;
+            if (sess.round) S.round = sess.round;
+            if (sess.bet) S.bet = sess.bet;
+            if (sess.initBal) S.initBal = sess.initBal;
+        } catch(e) {}
+        loadConfig();
         createUI();
             return;
         }
