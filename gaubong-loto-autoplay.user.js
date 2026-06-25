@@ -76,6 +76,7 @@
         busy: false,
         ended: false,
         processedRound: 0,  // 0=chua xu ly, 1=dang choi, 2=da xu ly ket qua
+        _lastResultTime: 0,  // timestamp xu ly ket qua gan nhat
         forceIdle: false,   // dang o trang thai reset, cho tick moi
         domStatus: -1,      // trang thai tu DOM
         action: '',
@@ -470,6 +471,7 @@
 
         S.processedRound = 2;
         S.ended = true;
+        S._lastResultTime = Date.now();
         return true;
     }
 
@@ -481,7 +483,7 @@
         S.busy = true;
 
         try {
-            // 1. Doc API (bo qua DOM vi Vue ko refresh)
+            // Doc API - nguon su that duy nhat
             const d = await getRoom();
             if (!d) {
                 S.action = '⏳ Chờ phòng...';
@@ -490,31 +492,34 @@
             }
             ui();
 
-            // 2. Dem tick de phat hien ket (neu qua 7 tick ~20s thi reload)
-            S._tickCount = (S._tickCount || 0) + 1;
-            if (S._tickCount > 7) {
-                log('⚠️ Qua 7 tick, reload de dong bo Vue...');
-                try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
-                location.reload();
-                return;
-            }
-
             // === STATUS 2: Game ended ===
             if (S.status === 2) {
+                // Tranh double process trong 15s
+                if (S._lastResultTime && Date.now() - S._lastResultTime < 15000) {
+                    S.action = '⏳ Chờ sau reset...';
+                    return;
+                }
+
                 S.action = '🏁 Kết thúc';
 
-                if (S.processedRound !== 2 && d.ketquas?.userWin) {
-                    const res = await handleResult(d);
-                    if (res && CFG.AUTO_RESTART) {
-                        await continueGame();
-                        S.processedRound = 2;
-                        try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
-                        log('🔄 Reload page...');
-                        location.reload();
+                // Xu ly ket qua neu co va chua xu ly
+                if (S.processedRound !== 2) {
+                    if (d.ketquas?.userWin) {
+                        await handleResult(d);
+                        // handleResult da set processedRound=2, _lastResultTime
+                    } else {
+                        S.action = '🏁 Đợi kết quả...';
                     }
-                } else {
-                    // Chua co ket qua, cho tick sau
-                    S.action = '🏁 Đợi kết quả...';
+                }
+
+                // Neu da xu ly va duoc auto restart
+                if (S.processedRound === 2 && CFG.AUTO_RESTART) {
+                    await continueGame();
+                    // continueGame set S.status=0, S.ended=false
+                    // KHONG reset processedRound ve 0 -> tranh double process
+                    // processedRound se duoc reset khi vao IDLE (status 0)
+                    S.action = '⏳ Đã reset...';
+                    log('🔄 Da reset, cho API cap nhat');
                 }
                 return;
             }
@@ -524,19 +529,19 @@
                 S.action = '🎮 Theo dõi...';
 
                 if (d.ketquas?.userWin && S.processedRound !== 2) {
-                    const res = await handleResult(d);
-                    if (res && CFG.AUTO_RESTART) {
-                        await continueGame();
-                        S.processedRound = 2;
-                        try { GM_setValue('loto_session', JSON.stringify({streak: S.streak, profit: S.profit, wins: S.wins, losses: S.losses, round: S.round, bet: S.bet, initBal: S.initBal})); } catch(e) {}
-                        log('🔄 Reload page...');
-                        location.reload();
-                    }
-                    return;
+                    await handleResult(d);
+                    // handleResult set processedRound=2
                 }
-                const kq = d.ketquas;
-                if (kq) {
-                    const drawn = kq.data?.length || 0;
+
+                if (S.processedRound === 2 && CFG.AUTO_RESTART) {
+                    await continueGame();
+                    // KHONG reset processedRound -> tranh double process khi API chua cap nhat
+                    S.action = '⏳ Chuyển sang ván mới...';
+                    log('🔄 Chuyen sang vong moi tu playing');
+                }
+
+                if (d.ketquas) {
+                    const drawn = d.ketquas.data?.length || 0;
                     S.action = `🎯 ${drawn} số`;
                 }
                 return;
@@ -557,22 +562,14 @@
                     await sleep(CFG.DELAY);
                     await addBots();
                     await sleep(CFG.DELAY);
-                    if (!await startGame()) {
-                        log('⚠️ Start that bai, tick sau thu lai');
-                    } else {
-                        S._tickCount = 0;
-                    }
+                    await startGame(); // muave + fallback
                 } else {
                     S.action = '🤖 Thêm bot...';
                     if (d.playerCountBot < CFG.MAX_BOTS) {
                         await addBots();
                         await sleep(CFG.DELAY);
                     }
-                    if (!await startGame()) {
-                        log('⚠️ Start that bai, tick sau thu lai');
-                    } else {
-                        S._tickCount = 0;
-                    }
+                    await startGame();
                 }
                 return;
             }
@@ -587,6 +584,7 @@
             ui();
         }
     }
+
 
 
     // ============================================================
