@@ -231,29 +231,22 @@
     async function addBots() {
         log('🤖 Thêm bot...');
         let added = S.bots;
-        for (let i = 0; i < CFG.MAX_BOTS; i++) {
+        for (let i = 0; i < CFG.MAX_BOTS * 2; i++) {
             if (added >= CFG.MAX_BOTS) break;
-            const ok = await clickContains('Bot');
-            if (ok) {
+            if (!S.roomId) break;
+            const r = await api('/api/game/loto/muave/add_bot', 'POST', { id: S.roomId });
+            if (r?.success) {
                 added++;
                 log(`  ✅ Bot ${added}/${CFG.MAX_BOTS}`);
-                await sleep(CFG.DELAY);
+                await sleep(500);
                 continue;
             }
-            // API fallback
-            if (S.roomId) {
-                const r = await api('/api/game/loto/muave/add_bot', 'POST', { id: S.roomId });
-                if (r?.success) {
-                    added++;
-                    log(`  ✅ Bot ${added}/${CFG.MAX_BOTS} (API)`);
-                    await sleep(CFG.DELAY);
-                    continue;
-                }
-            }
-            // Refresh room to check
+            // Maybe already have enough bots, refresh to check
             const d = await getRoom();
-            if (d && d.playerCountBot >= CFG.MAX_BOTS) { added = d.playerCountBot; break; }
-            break;
+            if (d) added = d.playerCountBot || added;
+            if (added >= CFG.MAX_BOTS) break;
+            log(`  ⚠️ add_bot API fail, thử lại...`);
+            await sleep(1000);
         }
         S.bots = added;
         log(`🤖 Bot: ${added}/${CFG.MAX_BOTS}`);
@@ -261,92 +254,68 @@
     }
 
     async function configureGame() {
-        log('⚙️ Cấu hình...');
-
-        // Mở settings
-        const gear = document.querySelector('button.icon-cog-2');
-        if (gear) { gear.click(); await sleep(500); }
-
-        // Chọn loại
-        const sel = document.querySelector('select.form-select.w-28');
-        if (sel) {
-            sel.value = String(CFG.GAME_TYPE);
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-
-        // Nhập giá vé
-        const inp = document.querySelector('input.form-input.w-40');
-        if (inp) {
-            inp.value = String(S.bet);
-            inp.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-
-        await sleep(400);
-
-        // Lưu
-        await clickContains('Lưu lại');
-        await sleep(CFG.DELAY);
-
-        // API fallback
+        log('⚙️ Cấu hình game...');
         if (S.roomId) {
-            await api('/api/game/loto/setting', 'POST', {
+            const r = await api('/api/game/loto/setting', 'POST', {
                 id: S.roomId, type: CFG.GAME_TYPE, cuoc: S.bet
             });
+            if (r?.success) log('✅ Đã lưu cấu hình (API)');
+            else log('⚠️ Setting API không phản hồi');
         }
-
-        log('✅ OK');
     }
 
     async function startGame() {
-        log('▶️ Bắt đầu...');
-
         const info = calcBet();
-        log(`  🎫 Vé: ${fmt(S.bet)} | 💰 Dư: ${fmt(S.bal)}`);
-        log(`  🏆 Lãi ròng nếu thắng: ${fmt(info.netProfit)}`);
+        log(`▶️ Bắt đầu #${S.round+1}... vé ${fmt(S.bet)} | dư ${fmt(S.bal)}`);
 
-        // Click "Bắt đầu" (nó tự động mua vé + start)
-        const ok = await clickContains('Bắt đầu');
-        if (ok) {
-            await sleep(2000);
-            const d = await getRoom();
-            if (d && d.room?.status === 1) {
-                S.round++;
-                S.ended = false;
-                // Đã mua vé → balance giảm
-                log(`✅ Game #${S.round} START!`);
-                ntf('🎮 Game #' + S.round,
-                    `Vé: ${fmt(S.bet)} | Thắng: +${fmt(info.netProfit)}`);
-                return true;
-            }
+        if (!S.roomId) { log('❌ No room ID'); return false; }
+
+        const r = await api('/api/game/loto/start', 'POST', {
+            id: S.roomId, type: CFG.GAME_TYPE, cuoc: S.bet
+        });
+
+        if (r?.success) {
+            S.round++;
+            S.ended = false;
+            log(`✅ Game #${S.round} START!`);
+            ntf('🎮 Game #' + S.round, `Vé: ${fmt(S.bet)} | Lãi: +${fmt(info.netProfit)}`);
+            return true;
         }
 
-        // API fallback
-        if (S.roomId) {
-            const r = await api('/api/game/loto/start', 'POST', {
+        // Check error message
+        const errMsg = r?.message || '';
+        if (errMsg.includes('2 người chơi')) {
+            log('⚠️ Cần thêm người chơi - đang thêm bot...');
+            await addBots();
+            await sleep(1000);
+            // Retry
+            const r2 = await api('/api/game/loto/start', 'POST', {
                 id: S.roomId, type: CFG.GAME_TYPE, cuoc: S.bet
             });
-            if (r?.success) {
-                S.round++;
-                S.ended = false;
-                log(`✅ Game #${S.round} START! (API)`);
-                ntf('🎮 Game #' + S.round,
-                    `Vé: ${fmt(S.bet)} | Thắng: +${fmt(info.netProfit)}`);
+            if (r2?.success) {
+                S.round++; S.ended = false;
+                log(`✅ Game #${S.round} START! (sau khi thêm bot)`);
+                ntf('🎮 Game #' + S.round, `Vé: ${fmt(S.bet)} | Lãi: +${fmt(info.netProfit)}`);
                 return true;
             }
         }
 
-        log('❌ Start failed');
+        log(`❌ Start failed: ${errMsg || 'unknown'}`);
         return false;
     }
 
     async function continueGame() {
-        log('🔄 Tiếp tục...');
+        log('🔄 Reset phòng...');
+        if (!S.roomId) return false;
+        const r = await api('/api/game/loto/reset', 'POST', { id: S.roomId });
+        if (r?.success) {
+            log('✅ Đã reset phòng');
+            await sleep(500);
+            return true;
+        }
+        log('⚠️ Reset API fail, thử click nút "Tiếp tục"...');
         const ok = await clickContains('Tiếp tục');
         if (ok) { await sleep(2000); return true; }
-        if (S.roomId) {
-            const r = await api('/api/game/loto/reset', 'POST', { id: S.roomId });
-            if (r?.success) { await sleep(1000); return true; }
-        }
         return false;
     }
 
