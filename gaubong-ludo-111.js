@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GauBong Ludo Auto-Play PRO 🎲
 // @namespace    http://tampermonkey.net/
-// @version      7.0.0
-// @description  Auto Ludo PRO v5. Wire aggressMode vào killBonus, recentPieces penalty in scoring, fix HS score âm.
+// @version      8.0.0
+// @description  Auto Ludo PRO v8. Phase-based scoring + depth + risk assessment + hard rules
 // @author       AutoPlay Pro
 // @match        https://gaubong.us/game/ludo*
 // @icon         https://gaubong.us/favicon.ico
@@ -41,7 +41,7 @@
     //   🎯 NEW #4: Aggression Toggle - Passive (mặc định) vs Blitz (luôn đánh)
     //   🎯 NEW #5: Stale State Guard - nếu API liên tiếp trả về cùng state → skip
     // v5.0.0- 26/06 - WIRE FIX + AI BRAIN UPGRADE:
-    //   🐛 FIX #1: aggressMode toggle có nút nhưng KHÔNG wired vào killBonus
+    //   🐛 REMOVED: aggressMode (phase-based thay thế)
     //      FIX: Blitz mode → killBonus nhân đôi (300 → 600)
     //   🐛 FIX #2: recentPieces được track nhưng KHÔNG dùng trong scoring
     //      FIX: Phạt spam quân trực tiếp trong score loop
@@ -104,7 +104,7 @@
         streak: 0,          // streak hiện tại (+win, -loss)
         bestStreak: 0,      // win streak cao nhất
         autoNextGame: true, // tự động join game tiếp theo
-        aggressMode: false, // Blitz mode: luôn capture nếu có thể
+        // Blitz mode: luôn capture nếu có thể
         lastReason: '',     // lý do nước đi cuối
         lastStateHash: '',  // guard chống stale state loop
         staleCount: 0,      // đếm số lần state không đổi liên tiếp
@@ -535,115 +535,215 @@
         return state;
     }
 
-    // Linear evaluator cho leaf nodes
-    // V = 0.0025·progress + 0.20·finished − 0.05·base + 0.01·safe
-    function evalSearchState(state, myPos) {
-        function evalPlayer(p) {
-            let progress = 0, finished = 0, base = 0, safeCnt = 0, onBoard = 0, inHS = 0;
-            for (const coord of Object.values(state.pieces[p])) {
-                if (coord === 'finished') { finished++; continue; }
-                if (!coord) { base++; continue; }
-                onBoard++;
-                const pp = posFromCoord(coord);
-                if (pp >= 0) {
-                    progress += advancement(EN[p], pp);
-                    if (isSafePos(pp)) safeCnt++;
-                } else {
-                    const hs = HS[String(p)];
-                    if (hs) {
-                        const idx = hs.indexOf(coord);
-                        if (idx >= 0) { progress += PL + idx; safeCnt++; inHS += idx + 1; }
-                    }
-                }
-            }
-            // PRO weights: base penalty mạnh, onBoard thưởng, HS bonus
-            return 0.003 * progress + 0.40 * finished - 0.50 * base + 0.15 * onBoard + 0.02 * safeCnt + 0.02 * inHS;
-        }
-
-        const myVal = evalPlayer(myPos);
-        let oppVal = 0, oppWeight = 0;
-        for (const p of [1,2,3,4]) {
-            if (p !== myPos) {
-                const pv = evalPlayer(p);
-                const w = Math.max(0.5, 1 + pv);
-                oppVal += pv * w;
-                oppWeight += w;
-            }
-        }
-        return myVal - (oppWeight > 0 ? oppVal / oppWeight : 0);
-    }
-
-    // Tìm đối thủ chính (người kế tiếp theo turn order, hoặc mạnh nhất)
-    function findMainOpponent(state) {
-        const myPos = state.myPos;
-        // Mặc định: người kế theo vòng 1→2→3→4→1
-        const nextP = nextPlayer(myPos);
-        const hasActive = Object.values(state.pieces[nextP]).some(c => c && c !== 'finished');
-        if (hasActive) return nextP;
-        // Fallback: chọn đối thủ có tiến triển nhiều nhất
-        let bestOpp = null, bestAdv = -1;
-        for (const p of [1,2,3,4]) {
-            if (p === myPos) continue;
-            let adv = 0;
-            for (const coord of Object.values(state.pieces[p])) {
-                if (coord && coord !== 'finished') {
-                    const pp = posFromCoord(coord);
-                    if (pp >= 0) adv += advancement(EN[p], pp);
-                    else {
-                        const hs = HS[String(p)];
-                        if (hs && hs.includes(coord)) adv += PL;
-                    }
-                }
-            }
-            if (adv > bestAdv) { bestAdv = adv; bestOpp = p; }
-        }
-        return bestOpp || nextP;
-    }
-
-    // Expectiminimax depth-limited search
-    function expectiminimax(state, myPos, depth, myTurn, dice) {
-        if (depth <= 0) return evalSearchState(state, myPos);
-
-        if (myTurn) {
-            // MAX node: tôi chọn nước đi tối ưu hóa expected value
-            const moves = getValidMoves(state, myPos, dice);
-            if (moves.length === 0) return evalSearchState(state, myPos);
-            let best = -Infinity;
-            for (const mv of moves) {
-                const ns = applySearchMove(cloneSearchState(state), mv);
-                const v = expectiminimax(ns, myPos, depth - 1, false, 0);
-                if (v > best) best = v;
-            }
-            return best;
-        } else {
-            // Lượt đối thủ
-            if (dice === 0) {
-                // Chance node: average uniform 6 mặt xúc sắc
-                let ev = 0;
-                for (let d = 1; d <= 6; d++) {
-                    ev += (1/6) * expectiminimax(cloneSearchState(state), myPos, depth, false, d);
-                }
-                return ev;
-            } else {
-                // MIN node: địch chọn nước đi tệ nhất cho tôi
-                const opp = findMainOpponent(state);
-                const moves = getValidMoves(state, opp, dice);
-                if (moves.length === 0) {
-                    return expectiminimax(cloneSearchState(state), myPos, depth - 1, true, 0);
-                }
-                let worst = Infinity;
-                for (const mv of moves) {
-                    const ns = applySearchMove(cloneSearchState(state), mv);
-                    const v = expectiminimax(ns, myPos, depth - 1, true, 0);
-                    if (v < worst) worst = v;
-                }
-                return worst;
-            }
-        }
-    }
-    
     // ================================================================
-    // chonQuanPro v6 — dùng Expectiminimax thay greedy 1-step scorer
+    // PHASE DETECTION
+    // ================================================================
+    function detectGamePhase(info, myPos, parsed) {
+        const atHome = info.filter(i => i.atHome).length;
+        const onBoard = info.filter(i => !i.atHome && !i.inHS).length;
+        const inHS = info.filter(i => i.inHS).length;
+        const totalOut = info.filter(i => !i.atHome).length;
+        
+        // Cuối game: có quân trong home stretch
+        if (inHS >= 2 || (inHS >= 1 && totalOut >= 3)) return 'late';
+        // Giữa game: đủ quân trên bàn
+        if (totalOut >= 3 && onBoard >= 2) return 'mid';
+        // Đầu game: còn nhiều quân ở nhà
+        return 'early';
+    }
+
+    // ================================================================
+    // RISK ASSESSMENT
+    // ================================================================
+    function assessCaptureRiskAfterMove(move, piece, enemies, myPos, parsed) {
+        // Tính xem sau khi đi nước này, quân có bị địch ăn ở lượt sau ko
+        if (move.to === 'finished' || piece.inHS) return 0;
+        const targetPP = posFromCoord(move.to);
+        if (targetPP < 0) return 0;
+        if (isSafePos(targetPP)) return 0;
+        
+        // Đếm số kết quả xx (1-6) mà địch có thể ăn quân này
+        let threatCount = 0;
+        for (const e of enemies) {
+            if (e.safe || e.pathPos < 0) continue;
+            const dist = (targetPP - e.pathPos + PL) % PL;
+            if (dist >= 1 && dist <= 6) threatCount++;
+        }
+        
+        // Hệ số quan trọng theo giai đoạn
+        const importance = piece.inHS ? 5 : piece.adv > 30 ? 4 : piece.adv > 15 ? 3 : 1;
+        return threatCount * importance;
+    }
+
+    function assessAllPiecesRisk(myPos, enemies, parsed) {
+        // Tổng rủi ro cho toàn bộ quân của mình
+        let totalRisk = 0;
+        const vitri = parsed.myVitri || {};
+        for (const [pid, coord] of Object.entries(vitri)) {
+            if (!coord || coord === 'finished') continue;
+            const pp = posFromCoord(coord);
+            if (pp < 0 || isSafePos(pp)) continue;
+            
+            let threatCount = 0;
+            for (const e of enemies) {
+                if (e.safe || e.pathPos < 0) continue;
+                const dist = (pp - e.pathPos + PL) % PL;
+                if (dist >= 1 && dist <= 6) threatCount++;
+            }
+            totalRisk += threatCount;
+        }
+        return totalRisk;
+    }
+
+    // ================================================================
+    // SCORING SYSTEM — dựa trên spec "4 bước"
+    // ================================================================
+    function scoreMove(move, piece, dice, myPos, parsed, enemies, phase) {
+        let immediateScore = 0;
+        
+        // === ĐIỂM DƯƠNG ===
+        // Về đích: +120
+        if (move.finish) immediateScore += 120;
+        // Ăn quân: +100
+        if (move.capture) immediateScore += 100;
+        // Vào ô an toàn: +40
+        if (move.to && move.to !== 'finished') {
+            const pp = posFromCoord(move.to);
+            if (pp >= 0 && isSafePos(pp)) immediateScore += 40;
+        }
+        // Cứu quân khỏi nguy hiểm: +50 (sẽ được xử lý ở hard rules)
+        
+        // Tiến gần đích: +15 đến +35
+        if (!piece.atHome && !piece.inHS) {
+            const d2fBefore = piece.d2f;
+            const newCoord = move.to;
+            const newD2f = newCoord === 'finished' ? 0 : distToFinish(myPos, posFromCoord(newCoord), newCoord);
+            const stepsCloser = d2fBefore - newD2f;
+            if (stepsCloser > 0) {
+                // Gần đích → thưởng cao hơn
+                const nearFinishBonus = (d2fBefore <= 10) ? 35 : (d2fBefore <= 20) ? 25 : 15;
+                immediateScore += Math.min(stepsCloser, 6) * nearFinishBonus / 6;
+            }
+        }
+        
+        // Ra quân: +20 nếu còn ít quân hoạt động, +10 nếu cần mở thế
+        if (piece.atHome && dice === 6) {
+            const onBoard = Object.values(parsed.myVitri || {}).filter(c => c && c !== 'finished').length;
+            if (onBoard <= 1) immediateScore += 20;
+            else if (onBoard <= 2) immediateScore += 10;
+            else immediateScore += 5; // Không cần thiết lắm
+        }
+        
+        // Tăng lựa chọn: +10 đến +25
+        // (sẽ được đánh giá sau qua số nước hợp lệ ở lượt kế)
+        
+        // === ĐIỂM TRỪ ===
+        // Tự hở nguy hiểm: -80 đến -150
+        const risk = assessCaptureRiskAfterMove(move, piece, enemies, myPos, parsed);
+        if (risk > 0) {
+            if (piece.inHS) immediateScore -= 150;
+            else if (piece.adv > 30) immediateScore -= 120;
+            else immediateScore -= 80;
+        }
+        // Mất cơ hội cứu quân đang nguy hiểm: -40 (hard rule)
+        
+        // === TRỌNG SỐ THEO GIAI ĐOẠN ===
+        if (phase === 'early') {
+            if (move.capture) immediateScore += 30; // ăn quân cực tốt
+            if (piece.atHome && dice === 6) immediateScore += 10; // ra quân tốt
+        } else if (phase === 'mid') {
+            if (move.capture) immediateScore += 20;
+            if (risk > 0) immediateScore -= 40; // rủi ro bị phạt nặng hơn
+        } else if (phase === 'late') {
+            if (move.finish) immediateScore += 60; // về đích cực kỳ ưu tiên
+            if (piece.inHS && !move.finish) immediateScore += 15; // tiến trong HS
+            if (!move.finish && !piece.inHS) immediateScore -= 20; // ko nên đi quân xa đích
+        }
+        
+        return immediateScore;
+    }
+
+    // ================================================================
+    // DEPTH EVALUATION: ImmediateScore + ReplyRisk + NextTurnValue
+    // ================================================================
+    function evaluateWithDepth(move, piece, dice, myPos, parsed, enemies, phase) {
+        const immediateScore = scoreMove(move, piece, dice, myPos, parsed, enemies, phase);
+        if (move.finish) return immediateScore; // Về đích ko cần depth
+        
+        // Mô phỏng nước đi
+        const searchState = makeSearchState(parsed, myPos);
+        const allMoves = getValidMoves(searchState, myPos, dice);
+        const thisMove = allMoves.find(m => m.pid === piece.pieceId);
+        if (!thisMove) return immediateScore;
+        
+        const afterState = applySearchMove(cloneSearchState(searchState), thisMove);
+        
+        // === DEPTH 2: Rủi ro phản đòn ===
+        let replyRisk = 0;
+        const maxDepth = (phase === 'early') ? 1 : (phase === 'mid') ? 2 : 2;
+        
+        // Simulate opponent's best response
+        for (let d = 1; d <= 6; d++) {
+            const opp = findMainOpponent(afterState);
+            const oppMoves = getValidMoves(afterState, opp, d);
+            
+            // For each opponent dice outcome, find worst case for us
+            let worstLoss = 0;
+            for (const om of oppMoves) {
+                const oppAfter = applySearchMove(cloneSearchState(afterState), om);
+                // Check if we lost any pieces
+                const myAfter = oppAfter.pieces[myPos] || {};
+                const beforePieces = Object.values(afterState.pieces[myPos] || {}).filter(c => c && c !== 'finished').length;
+                const afterPieces = Object.values(myAfter).filter(c => c && c !== 'finished').length;
+                const lostPieces = beforePieces - afterPieces;
+                
+                if (lostPieces > 0) {
+                    const pieceVal = piece.inHS ? 150 : piece.adv > 30 ? 120 : 80;
+                    worstLoss = Math.max(worstLoss, lostPieces * pieceVal);
+                }
+            }
+            replyRisk += worstLoss / 6; // Average over all dice
+        }
+        
+        // === DEPTH 3: Giá trị lượt sau ===
+        let nextTurnValue = 0;
+        if (maxDepth >= 2) {
+            // Simulate our next turn after opponent's response
+            // Count how many valid moves we'll have
+            for (let od = 1; od <= 6; od++) {
+                const oppTemp = findMainOpponent(afterState);
+                const oppTempMoves = getValidMoves(afterState, oppTemp, od);
+                if (oppTempMoves.length > 0) {
+                    // Opponent picks the worst for us (simplified: first move)
+                    const worstOpp = oppTempMoves.reduce((worst, om) => {
+                        const sim = applySearchMove(cloneSearchState(afterState), om);
+                        const myCount = Object.values(sim.pieces[myPos] || {}).filter(c => c && c !== 'finished').length;
+                        return myCount < worst.count ? {count: myCount, move: om} : worst;
+                    }, {count: Infinity, move: null});
+                    
+                    if (worstOpp.move) {
+                        const afterOpp = applySearchMove(cloneSearchState(afterState), worstOpp.move);
+                        // Count our options next turn (average over dice)
+                        let optionsCount = 0;
+                        for (let md = 1; md <= 6; md++) {
+                            const myNextMoves = getValidMoves(afterOpp, myPos, md);
+                            optionsCount += myNextMoves.length;
+                        }
+                        nextTurnValue += optionsCount / 6 * 3; // ~3 points per option
+                    }
+                }
+            }
+            nextTurnValue = nextTurnValue / 6; // Average over opponent dice
+        }
+        
+        // === TỔNG ĐIỂM ===
+        // Score = Immediate + 0.7 * (-ReplyRisk) + 0.5 * NextTurnValue
+        const total = immediateScore - 0.7 * replyRisk + 0.5 * nextTurnValue;
+        return total;
+    }
+
+    // ================================================================
+    // PRO AI: chonQuanPro — Phase-based scoring with depth
     // ================================================================
     function chonQuanPro(pieces, myPos, dice, parsed) {
         if (!pieces || pieces.length === 0) return null;
@@ -653,128 +753,148 @@
         const rp = ST.recentPieces;
 
         const info = pieces.map(p => pieceInfo(myPos, p, vitri));
-        let debugPieces = info.map(i => `Q${i.pieceId}=[${i.atHome?'🏠':i.inHS?'🛣️':'🚶'}${i.pathPos>=0?'@'+i.pathPos:''} ${i.adv>=0?'adv='+i.adv:''} ${i.safe?'🔒':''} ${i.d2f<999?'d2f='+i.d2f:''}]`).join(' ');
-        log(`[PRO] xx=${dice} | ${debugPieces}`);
-
-        // ── OVERRIDE 1: VỀ ĐÍCH ─────────────────────────
-        for (const pi of info)
-            if (!pi.atHome && pi.d2f === dice) {
-                log(`[PRO] 🏁 Q${pi.pieceId} về đích!`);
-                trackUsage(rp, pi.pieceId);
-                ST.lastReason = `🏁 Q${pi.pieceId} về đích`; return pi.pieceId;
-            }
-
-        // ── OVERRIDE 2: RA QUÂN KHI XX=6 ────────────────
-        const atHome = info.filter(i => i.atHome).length;
-        const onBoard = info.filter(i => !i.atHome && !i.inHS).length;
-        const totalOut = info.filter(i => !i.atHome).length;
+        const phase = detectGamePhase(info, myPos, parsed);
         
-        if (dice === 6 && atHome > 0) {
-            // Release piece unless urgent capture opportunity
-            let urgentCapture = null;
-            if (onBoard >= 2) {
-                for (const pi of info)
-                    if (!pi.atHome && !pi.inHS) { const cap = canCapture(pi, dice, enemies); if (cap) { urgentCapture = pi; break; } }
-            }
-            if (!urgentCapture || atHome >= 2) {
-                for (const pi of info) if (pi.atHome) {
-                    log(`[PRO] 🏠 Q${pi.pieceId} ra quân xx=6`);
-                    trackUsage(rp, pi.pieceId);
-                    ST.lastReason = `🏠 Q${pi.pieceId} ra quân`; return pi.pieceId;
+        let debug = info.map(i => `Q${i.pieceId}=${i.atHome?'🏠':i.inHS?'🛣️@'+i.hsIdx:'🚶@'+i.pathPos}${i.safe?'🔒':''}${i.d2f<999?' d2f='+i.d2f:''}`).join(' ');
+        log(`[PRO] ${phase.toUpperCase()} xx=${dice} | ${debug}`);
+
+        // ================================================================
+        // HARD PRIORITY RULES (theo spec mục 11)
+        // ================================================================
+        
+        // 1. Nước về đích (nếu rủi ro ko quá cao)
+        for (const pi of info) {
+            if (pi.d2f === dice) {
+                // Kiểm tra rủi ro phản đòn
+                const riskAfter = enemies.some(e => {
+                    if (e.pathPos < 0) return false;
+                    const dist = (pi.pathPos - e.pathPos + PL) % PL;
+                    return dist >= 1 && dist <= 6;
+                });
+                if (!riskAfter) {
+                    log(`[PRO] 🏁 Q${pi.pieceId} về đích (an toàn)`);
+                    trackPiece(rp, pi.pieceId);
+                    ST.lastReason = `🏁 Q${pi.pieceId} về đích`;
+                    return pi.pieceId;
                 }
             }
         }
-
-        // ── OVERRIDE 3: CAPTURE ──────────────────────────
-        if (dice > 0) {
-            for (const pi of info) if (!pi.atHome && !pi.inHS) {
+        
+        // 2. Nước ăn quân đối thủ
+        for (const pi of info) {
+            if (!pi.atHome && !pi.inHS) {
                 const cap = canCapture(pi, dice, enemies);
                 if (cap) {
                     const newPos = (pi.pathPos + dice) % PL;
                     const safeAfter = isSafePos(newPos);
-                    if (safeAfter || ST.aggressMode || !isThreatenedAfterMove(pi, dice, enemies)) {
-                        log(`[PRO] ⚔️ Q${pi.pieceId} ăn P${cap.owner}!`);
-                        trackUsage(rp, pi.pieceId);
-                        ST.lastReason = `⚔️ Q${pi.pieceId} capture`; return pi.pieceId;
+                    // Chỉ lấy nếu ko bị phản đòn nặng
+                    const dangerAfter = enemies.some(e => {
+                        if (e.owner === cap.owner || e.pathPos < 0 || e.safe) return false;
+                        const dist = (newPos - e.pathPos + PL) % PL;
+                        return dist >= 1 && dist <= 6;
+                    });
+                    if (safeAfter || !dangerAfter) {
+                        log(`[PRO] ⚔️ Q${pi.pieceId} ăn P${cap.owner}`);
+                        trackPiece(rp, pi.pieceId);
+                        ST.lastReason = `⚔️ Q${pi.pieceId} capture`;
+                        return pi.pieceId;
+                    }
+                }
+            }
+        }
+        
+        // 3. Cứu quân đang nguy hiểm
+        for (const pi of info) {
+            if (!pi.atHome && !pi.inHS && !pi.safe) {
+                const isThreatened = enemies.some(e => {
+                    if (e.pathPos < 0 || e.safe) return false;
+                    const dist = (pi.pathPos - e.pathPos + PL) % PL;
+                    return dist >= 1 && dist <= 6;
+                });
+                if (isThreatened) {
+                    const newPos = (pi.pathPos + dice) % PL;
+                    const willBeSafe = isSafePos(newPos);
+                    if (willBeSafe) {
+                        log(`[PRO] 🛡️ Q${pi.pieceId} thoát hiểm!`);
+                        trackPiece(rp, pi.pieceId);
+                        ST.lastReason = `🛡️ Q${pi.pieceId} thoát`;
+                        return pi.pieceId;
                     }
                 }
             }
         }
 
-        // ── OVERRIDE 4: THOÁT HIỂM ──────────────────────
-        for (const pi of info) if (!pi.atHome && !pi.inHS && !pi.safe) {
-            const threatened = enemies.some(e => e.pathPos >= 0 && (pi.pathPos - e.pathPos + PL) % PL <= 6 && !e.safe);
-            if (threatened) {
-                const newPos = (pi.pathPos + dice) % PL;
-                if (isSafePos(newPos) || canCapture(pi, dice, enemies)) {
-                    log(`[PRO] 🛡️ Q${pi.pieceId} thoát hiểm → safe!`);
-                    trackUsage(rp, pi.pieceId);
-                    ST.lastReason = `🛡️ Q${pi.pieceId} thoát`; return pi.pieceId;
-                }
-            }
-        }
-
-        // ── PRO SEARCH: EXPECTIMINIMAX ───────────────────
+        // 4-10. Scoring-based selection with depth
         const searchState = makeSearchState(parsed, myPos);
-        const validMovesAll = getValidMoves(searchState, myPos, dice);
+        const allMoves = getValidMoves(searchState, myPos, dice);
         
-        // Build candidate list: only pieces with valid moves in search state
         let candidates = [];
         for (const pi of info) {
-            const move = validMovesAll.find(m => m.pid === pi.pieceId);
+            const move = allMoves.find(m => m.pid === pi.pieceId);
             if (!move) continue;
             
-            const newState = applySearchMove(cloneSearchState(searchState), move);
-            let value = expectiminimax(newState, myPos, 2, false, 0);
+            // Calculate total score with depth
+            const totalScore = evaluateWithDepth(move, pi, dice, myPos, parsed, enemies, phase);
             
-            // Recent-pieces penalty
+            // Recent-pieces penalty (chống spam 1 quân)
             const used = rp[String(pi.pieceId)] || 0;
-            if (used > 0) { const penalty = used * 0.03; value -= penalty; }
+            const spamPenalty = used * 10; // -10 per use
             
-            // Bonus for releasing piece (even if not caught by override)
-            if (pi.atHome) value += 0.3; // BONUS: ra quân luôn có lợi
+            // Phase-based final weighting
+            let finalScore = totalScore - spamPenalty;
             
-            // Capture bonus in eval
-            if (move.capture) value += 0.2;
+            if (phase === 'late' && pi.inHS) finalScore += 30; // cuối game ưu tiên HS
+            if (phase === 'early' && pi.atHome && dice === 6) finalScore += 20; // đầu game ưu tiên ra quân
             
-            // Safety bonus
-            if (move.to && move.to !== 'finished') {
-                const pp = posFromCoord(move.to);
-                if (pp >= 0 && isSafePos(pp)) value += 0.05;
-            }
-            
-            candidates.push({ pid: pi.pieceId, value, adv: pi.adv || 0 });
-            log(`   [PRO] Q${pi.pieceId}: v=${value.toFixed(4)}${used>0?' (penalty='+used+')':''}`);
+            candidates.push({ pid: pi.pieceId, score: finalScore, adv: pi.adv||0, safe: pi.safe });
+            log(`   [PRO] Q${pi.pieceId}: total=${totalScore.toFixed(2)}${used>0?' -spam='+spamPenalty:''} = ${finalScore.toFixed(2)}`);
         }
         
-        // Select best candidate
+        // Pick best
         if (candidates.length === 0) {
-            // No valid moves in search state - just use first piece from API
-            log(`[PRO] ⚠️ search: no valid moves, pick first`);
-            let bestPiece = pieces[0]; let bestValue = 0;
-        } else {
-            candidates.sort((a, b) => b.value !== a.value ? b.value - a.value : b.adv - a.adv);
-            let bestPiece = candidates[0].pid; let bestValue = candidates[0].value;
+            log(`[PRO] ⚠️ No valid moves, fallback Q${pieces[0]}`);
+            trackPiece(rp, pieces[0]);
+            ST.lastReason = `[PRO] fallback Q${pieces[0]}`;
+            return pieces[0];
         }
         
-        trackUsage(rp, bestPiece);
-        log(`[PRO] → Q${bestPiece} val=${bestValue.toFixed(2)}`);
-        ST.lastReason = `[PRO] Q${bestPiece} v=${bestValue.toFixed(2)}`;
-        return bestPiece;
+        candidates.sort((a, b) => b.score !== a.score ? b.score - a.score : b.adv - a.adv);
+        const best = candidates[0];
+        
+        trackPiece(rp, best.pid);
+        log(`[PRO] → Q${best.pid} score=${best.score.toFixed(2)}`);
+        ST.lastReason = `[PRO] Q${best.pid} ${best.score.toFixed(0)}đ`;
+        return best.pid;
     }
 
-    function trackUsage(rp, pid) {
+    function trackPiece(rp, pid) {
         rp[String(pid)] = (rp[String(pid)] || 0) + 1;
         if (rp[String(pid)] > 6) {
             for (const k of Object.keys(rp)) rp[k] = Math.max(0, Math.floor(rp[k] * 0.6));
         }
+        sv();
     }
-    
-    function isThreatenedAfterMove(pi, dice, enemies) {
-        if (pi.atHome || pi.inHS) return false;
-        const newPos = (pi.pathPos + dice) % PL;
-        if (isSafePos(newPos)) return false;
-        return enemies.some(e => e.pathPos >= 0 && (newPos - e.pathPos + PL) % PL <= 6 && !e.safe);
+
+    // Helper: find main opponent (giữ lại từ code cũ)
+    function findMainOpponent(state) {
+        const myPos = state.myPos;
+        const nextP = nextPlayer(myPos);
+        const hasActive = Object.values(state.pieces[nextP]).some(c => c && c !== 'finished');
+        if (hasActive) return nextP;
+        let bestOpp = null, bestAdv = -1;
+        for (const p of [1,2,3,4]) {
+            if (p === myPos) continue;
+            let adv = 0;
+            for (const coord of Object.values(state.pieces[p])) {
+                if (coord && coord !== 'finished') {
+                    const pp = posFromCoord(coord);
+                    if (pp >= 0) adv += advancement(EN[p], pp);
+                    else { const hs = HS[String(p)]; if (hs && hs.includes(coord)) adv += PL; }
+                }
+            }
+            if (adv > bestAdv) { bestAdv = adv; bestOpp = p; }
+        }
+        return bestOpp || nextP;
     }
     // ================================================================
     // GAME LOOP
@@ -1303,9 +1423,6 @@
                 <div id="gb-pro-rslt" style="color:#8b949e;font-style:italic;font-size:11px;">${ST.lastResult||''}</div>
             </div>
             <div style="display:flex;gap:6px;margin-bottom:6px;">
-                <button id="gb-pro-aggress" title="Blitz Mode: luôn capture khi có thể" style="flex:1;padding:4px 0;border:1px solid ${ST.aggressMode?'#d29922':'#30363d'};border-radius:6px;background:${ST.aggressMode?'rgba(210,153,34,0.15)':'transparent'};color:${ST.aggressMode?'#d29922':'#8b949e'};font-size:11px;cursor:pointer;">
-                    ${ST.aggressMode?'🔥 Blitz':'🧘 Passive'}
-                </button>
                 <button id="gb-pro-autonext" title="Tự động bắt đầu ván mới" style="flex:1;padding:4px 0;border:1px solid ${ST.autoNextGame?'#58a6ff':'#30363d'};border-radius:6px;background:${ST.autoNextGame?'rgba(88,166,255,0.1)':'transparent'};color:${ST.autoNextGame?'#58a6ff':'#8b949e'};font-size:11px;cursor:pointer;">
                     ${ST.autoNextGame?'🔄 AutoNext':'⏸ Manual'}
                 </button>
@@ -1353,15 +1470,6 @@
         rstBtn.onmouseleave = function(){ this.style.background='transparent'; };
         rstBtn.onclick = function(){ if(confirm('⚠️ Xoá toàn bộ dữ liệu?')){ rs(); sB(); } };
 
-        document.getElementById('gb-pro-aggress').onclick = function() {
-            ST.aggressMode = !ST.aggressMode;
-            sv();
-            this.style.borderColor = ST.aggressMode ? '#d29922' : '#30363d';
-            this.style.background = ST.aggressMode ? 'rgba(210,153,34,0.15)' : 'transparent';
-            this.style.color = ST.aggressMode ? '#d29922' : '#8b949e';
-            this.textContent = ST.aggressMode ? '🔥 Blitz' : '🧘 Passive';
-            log(`🔥 AggressMode: ${ST.aggressMode}`);
-        };
         
         document.getElementById('gb-pro-autonext').onclick = function() {
             ST.autoNextGame = !ST.autoNextGame;
@@ -1443,7 +1551,7 @@
     // BOOT
     // ================================================================
     function boot() {
-        log('🎲 Ludo Auto-Play PRO v5.0 - aggressMode WIRED | recentPieces IN SCORE | HS fix | stale guard');
+        log('🎲 Ludo Auto-Play PRO v5.0 - Phase-based PRO AI | Depth eval | Risk assessment | Multi-phase');
         log(`📋 Ô an toàn: ${SAFE_CELLS.map(i => `${i}(${SAFE_COORDS[i]||'?'})`).join(', ')}`);
         mkUI();
         if (ST.enabled && ridU()) {
@@ -1472,6 +1580,6 @@
         stop() { ST.enabled = false; sv(); sB(); sD(); stp(); },
         reset: rs,
         state: ST,
-        version: '7.0.0',
+        version: '8.0.0',
     };
 })();
