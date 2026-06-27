@@ -625,84 +625,84 @@
     // ================================================================
     // SCORING SYSTEM — dựa trên spec "4 bước"
     // ================================================================
-    function scoreMove(move, piece, dice, myPos, parsed, enemies, phase) {
+function scoreMove(move, piece, dice, myPos, parsed, enemies, phase) {
         let immediateScore = 0;
-        const opp = parsed.opponentCount || 3; // 1=bàn 2ng, 2=bàn 3ng, 3=bàn 4ng
-        
-        // === Hệ số theo số đối thủ ===
-        // Bàn 2 người: cực hung hăng (1v1 thuần túy, mỗi quân bị ăn = lợi thế trực tiếp)
-        // Bàn 3 người: cân bằng
-        // Bàn 4 người: thận trọng hơn (nhiều mối đe dọa từ nhiều phía)
+        const opp = parsed.opponentCount || 3;
         const captureBonus  = opp === 1 ? 160 : opp === 2 ? 110 : 100;
-        const riskMult      = opp === 1 ? 0.5  : opp === 2 ? 0.8  : 1.0;  // bàn 2ng ít rủi ro hơn (chỉ 1 địch)
+        const riskMult      = opp === 1 ? 0.5  : opp === 2 ? 0.8  : 1.0;
         
-        // === ĐIỂM DƯƠNG ===
-        // Về đích: +120
         if (move.finish) immediateScore += 120;
-        // Ăn quân: thưởng theo số đối thủ
         if (move.capture) immediateScore += captureBonus;
-        // Vào ô an toàn: +40
         if (move.to && move.to !== 'finished') {
             const pp = posFromCoord(move.to);
             if (pp >= 0 && isSafePos(pp)) immediateScore += 40;
         }
-        // Cứu quân khỏi nguy hiểm: +50 (sẽ được xử lý ở hard rules)
         
-        // Tiến gần đích: +15 đến +35
         if (!piece.atHome && !piece.inHS) {
             const d2fBefore = piece.d2f;
             const newCoord = move.to;
             const newD2f = newCoord === 'finished' ? 0 : distToFinish(myPos, posFromCoord(newCoord), newCoord);
             const stepsCloser = d2fBefore - newD2f;
             if (stepsCloser > 0) {
-                // Gần đích → thưởng cao hơn
                 const nearFinishBonus = (d2fBefore <= 10) ? 35 : (d2fBefore <= 20) ? 25 : 15;
                 immediateScore += Math.min(stepsCloser, 6) * nearFinishBonus / 6;
             }
         }
         
-        // Ra quân: +30 mọi trường hợp (ô xuất phát an toàn tuyệt đối + lượt bonus)
-        // Lưu ý: hard rule đã xử lý xuất quân bắt buộc; đây là fallback cho scoring.
-        if (piece.atHome && dice === 6) {
-            immediateScore += 30;
+        if (piece.atHome && dice === 6) immediateScore += 30;
+        
+        // Leapfrog: kéo quân sau tạo mối đe dọa
+        if (move._leapfrog) immediateScore += 25;
+        
+        // Da dang hoa: duy tri >=2 quan
+        if (move._activePiecesAfter !== undefined) {
+            if (move._activePiecesAfter >= 2) {
+                immediateScore += 15;
+            } else if (move._totalActive > 1 && move._activePiecesAfter <= 1) {
+                immediateScore -= 50;
+            }
         }
         
-        // Tăng lựa chọn: +10 đến +25
-        // (sẽ được đánh giá sau qua số nước hợp lệ ở lượt kế)
-        
-        // === ĐIỂM TRỪ ===
-        // Tự hở nguy hiểm: nhân với riskMult theo số đối thủ
+        // DIEM TRU
         const risk = assessCaptureRiskAfterMove(move, piece, enemies, myPos, parsed);
         if (risk > 0) {
-            let penalty = piece.inHS ? 150 : piece.adv > 30 ? 120 : 80;
+            const disasterValue = piece.inHS ? 150 : Math.max(30, Math.min(100, (piece.adv || 0) * 2));
+            let penalty = piece.inHS ? 150 : piece.adv > 30 ? 130 : Math.max(80, disasterValue);
             immediateScore -= penalty * riskMult;
         }
-        // Mất cơ hội cứu quân đang nguy hiểm: -40 (hard rule)
         
-        // === TRỌNG SỐ THEO GIAI ĐOẠN ===
+        
+        // TRONG SO GIAI DOAN
         if (phase === 'early') {
-            if (move.capture) immediateScore += opp === 1 ? 50 : 30; // 1v1 cực kỳ quan trọng
+            if (move.capture) immediateScore += opp === 1 ? 50 : 30;
             if (piece.atHome && dice === 6) immediateScore += 10;
+            if (move._activePiecesAfter !== undefined && move._activePiecesAfter >= 2) {
+                immediateScore += 10;
+            }
         } else if (phase === 'mid') {
             if (move.capture) immediateScore += opp === 1 ? 35 : 20;
             if (risk > 0) immediateScore -= 40 * riskMult;
+            if (move._spreadBonus) immediateScore += 20;
         } else if (phase === 'late') {
             if (move.finish) immediateScore += 60;
             if (piece.inHS && !move.finish) immediateScore += 15;
-            if (!move.finish && !piece.inHS) immediateScore -= 20;
+            if (!move.finish && !piece.inHS) immediateScore -= 25;
+            if (move._sacrificialCapture) immediateScore += 80;
         }
         
         return immediateScore;
     }
 
+
+
     // ================================================================
     // DEPTH EVALUATION: ImmediateScore + ReplyRisk + NextTurnValue
     // ================================================================
-    function evaluateWithDepth(move, piece, dice, myPos, parsed, enemies, phase) {
+function evaluateWithDepth(move, piece, dice, myPos, parsed, enemies, phase, extraInfo) {
+        if (extraInfo) Object.assign(move, extraInfo);
         const immediateScore = scoreMove(move, piece, dice, myPos, parsed, enemies, phase);
-        if (move.finish) return immediateScore; // Về đích ko cần depth
+        if (move.finish) return immediateScore;
         
-        // Mô phỏng nước đi
         const searchState = makeSearchState(parsed, myPos);
         const allMoves = getValidMoves(searchState, myPos, dice);
         const thisMove = allMoves.find(m => m.pid === piece.pieceId);
@@ -710,74 +710,71 @@
         
         const afterState = applySearchMove(cloneSearchState(searchState), thisMove);
         
-        // === DEPTH 2: Rủi ro phản đòn ===
         let replyRisk = 0;
         const maxDepth = (phase === 'early') ? 1 : (phase === 'mid') ? 2 : 2;
         
-        // Simulate opponent's best response
         for (let d = 1; d <= 6; d++) {
             const opp = findMainOpponent(afterState);
             const oppMoves = getValidMoves(afterState, opp, d);
-            
-            // For each opponent dice outcome, find worst case for us
             let worstLoss = 0;
             for (const om of oppMoves) {
                 const oppAfter = applySearchMove(cloneSearchState(afterState), om);
-                // Check if we lost any pieces
                 const myAfter = oppAfter.pieces[myPos] || {};
                 const beforePieces = Object.values(afterState.pieces[myPos] || {}).filter(c => c && c !== 'finished').length;
                 const afterPieces = Object.values(myAfter).filter(c => c && c !== 'finished').length;
                 const lostPieces = beforePieces - afterPieces;
-                
                 if (lostPieces > 0) {
-                    const pieceVal = piece.inHS ? 150 : piece.adv > 30 ? 120 : 80;
+                    let pieceVal = 80;
+                    for (const [pid, coord] of Object.entries(afterState.pieces[myPos] || {})) {
+                        if (coord && coord !== 'finished' && !oppAfter.pieces[myPos][pid]) {
+                            const pp = posFromCoord(coord);
+                            const adv = pp >= 0 ? advancement(EN[myPos], pp) : 50;
+                            pieceVal = Math.max(pieceVal, Math.min(150, Math.max(30, adv * 2)));
+                        }
+                    }
                     worstLoss = Math.max(worstLoss, lostPieces * pieceVal);
                 }
             }
-            replyRisk += worstLoss / 6; // Average over all dice
+            replyRisk += worstLoss / 6;
         }
         
-        // === DEPTH 3: Giá trị lượt sau ===
         let nextTurnValue = 0;
         if (maxDepth >= 2) {
-            // Simulate our next turn after opponent's response
-            // Count how many valid moves we'll have
+            const diceWeights = {1:1, 2:1, 3:1, 4:1, 5:1, 6:1.5};
             for (let od = 1; od <= 6; od++) {
                 const oppTemp = findMainOpponent(afterState);
                 const oppTempMoves = getValidMoves(afterState, oppTemp, od);
                 if (oppTempMoves.length > 0) {
-                    // Opponent picks the worst for us (simplified: first move)
                     const worstOpp = oppTempMoves.reduce((worst, om) => {
                         const sim = applySearchMove(cloneSearchState(afterState), om);
                         const myCount = Object.values(sim.pieces[myPos] || {}).filter(c => c && c !== 'finished').length;
                         return myCount < worst.count ? {count: myCount, move: om} : worst;
                     }, {count: Infinity, move: null});
-                    
                     if (worstOpp.move) {
                         const afterOpp = applySearchMove(cloneSearchState(afterState), worstOpp.move);
-                        // Count our options next turn (average over dice)
                         let optionsCount = 0;
                         for (let md = 1; md <= 6; md++) {
                             const myNextMoves = getValidMoves(afterOpp, myPos, md);
-                            optionsCount += myNextMoves.length;
+                            optionsCount += myNextMoves.length * (diceWeights[md] || 1);
                         }
-                        nextTurnValue += optionsCount / 6 * 3; // ~3 points per option
+                        const weightSum = Object.values(diceWeights).reduce((a,b)=>a+b, 0);
+                        nextTurnValue += (optionsCount / weightSum) * 3;
                     }
                 }
             }
-            nextTurnValue = nextTurnValue / 6; // Average over opponent dice
+            nextTurnValue = nextTurnValue / 6;
         }
         
-        // === TỔNG ĐIỂM ===
-        // Score = Immediate + 0.7 * (-ReplyRisk) + 0.5 * NextTurnValue
-        const total = immediateScore - 0.7 * replyRisk + 0.5 * nextTurnValue;
+        const total = immediateScore - 0.7 * replyRisk + 0.3 * nextTurnValue;
         return total;
     }
+
+
 
     // ================================================================
     // PRO AI: chonQuanPro — Phase-based scoring with depth
     // ================================================================
-    function chonQuanPro(pieces, myPos, dice, parsed) {
+function chonQuanPro(pieces, myPos, dice, parsed) {
         if (!pieces || pieces.length === 0) return null;
         const vitri = parsed.myVitri || {};
         const enemies = getEnemyPieces(parsed);
@@ -787,135 +784,221 @@
         const info = pieces.map(p => pieceInfo(myPos, p, vitri));
         const phase = detectGamePhase(info, myPos, parsed);
         const oppCntLabel = {1:'1v1', 2:'1v2', 3:'1v3'}[parsed.opponentCount] || '?';
+        const PL = 52;
         
-        let debug = info.map(i => `Q${i.pieceId}=${i.atHome?'🏠':i.inHS?'🛣️@'+i.hsIdx:'🚶@'+i.pathPos}${i.safe?'🔒':''}${i.d2f<999?' d2f='+i.d2f:''}`).join(' ');
-        log(`[PRO] ${phase.toUpperCase()} ${oppCntLabel} xx=${dice} | ${debug}`);
+        let debug = info.map(function(i) {
+            var tag = i.atHome ? '\ud83c\udfe0' : (i.inHS ? '\ud83d\udee3\ufe0f@' + i.hsIdx : '\ud83d\udeb6@' + i.pathPos);
+            var extra = i.safe ? '\ud83d\udd12' : '';
+            var d2f = i.d2f < 999 ? ' d2f=' + i.d2f : '';
+            return 'Q' + i.pieceId + '=' + tag + extra + d2f;
+        }).join(' ');
+        log('[PRO] ' + phase.toUpperCase() + ' ' + oppCntLabel + ' xx=' + dice + ' | ' + debug);
 
-        // ================================================================
-        // HARD PRIORITY RULES (theo spec mục 11)
-        // ================================================================
+        // === HARD PRIORITY RULES ===
         
-        // 1. Nước về đích → LUÔN ưu tiên tuyệt đối
-        //    BUG FIX v8.1: Cũ có risk-check sai — về đích = quân rời bàn, không thể bị ăn.
-        //    Hơn nữa, quân đang bị đe dọa mà về đích được là TỐT NHẤT (thoát + lượt thưởng).
-        for (const pi of info) {
+        // [RULE 1] Ve dich
+        for (var pi_idx = 0; pi_idx < info.length; pi_idx++) {
+            var pi = info[pi_idx];
             if (pi.d2f === dice) {
-                log(`[PRO] 🏁 Q${pi.pieceId} về đích!`);
+                log('[PRO] \ud83c\udfc1 Q' + pi.pieceId + ' ve dich!');
                 trackPiece(rp, pi.pieceId);
-                ST.lastReason = `🏁 Q${pi.pieceId} về đích`;
+                ST.lastReason = '\ud83c\udfc1 Q' + pi.pieceId + ' ve dich';
                 return pi.pieceId;
             }
         }
 
-        // 2. XUẤT QUÂN BẮT BUỘC: dice=6 + còn quân trong chuồng
-        //    META FIX v8.1: Đây là quy tắc bắt buộc, không phải lựa chọn.
-        //    Lợi ích kép: ô xuất phát an toàn tuyệt đối + ngay lập tức được thêm lượt bonus.
-        //    Không có ngoại lệ (trừ khi không còn quân trong chuồng — khi đó skip sang rule tiếp theo).
+        // [RULE 2] XUAT QUAN BAT BUOC khi dice=6
         if (dice === 6) {
-            const homePieces = info.filter(pi => pi.atHome);
+            var homePieces = info.filter(function(p) { return p.atHome; });
             if (homePieces.length > 0) {
-                const deployPiece = homePieces[0];
-                log(`[PRO] 🚀 Q${deployPiece.pieceId} XUẤT QUÂN bắt buộc (${homePieces.length} quân còn trong chuồng)`);
+                var deployPiece = homePieces[0];
+                log('[PRO] \ud83d\ude80 Q' + deployPiece.pieceId + ' XUAT QUAN bat buoc (' + homePieces.length + ' quan con trong chuong)');
                 trackPiece(rp, deployPiece.pieceId);
-                ST.lastReason = `🚀 Xuất Q${deployPiece.pieceId} (${homePieces.length} trong chuồng)`;
+                ST.lastReason = '\ud83d\ude80 Xuat Q' + deployPiece.pieceId + ' (' + homePieces.length + ' trong chuong)';
                 return deployPiece.pieceId;
             }
         }
-        
-        // 3. Nước ăn quân đối thủ (chỉ áp dụng khi không còn quân chuồng hoặc dice≠6)
-        const oppCount = parsed.opponentCount || 3;
-        for (const pi of info) {
-            if (!pi.atHome && !pi.inHS) {
-                const cap = canCapture(pi, dice, enemies);
-                if (cap) {
-                    const newPos = (pi.pathPos + dice) % PL;
-                    const safeAfter = isSafePos(newPos);
-                    // Bàn 2 người: 1v1 thuần túy → luôn ăn nếu có thể (không lo phản đòn từ người thứ 3)
-                    if (oppCount === 1) {
-                        log(`[PRO] ⚔️ Q${pi.pieceId} ăn P${cap.owner} [1v1 → always capture]`);
-                        trackPiece(rp, pi.pieceId);
-                        ST.lastReason = `⚔️ Q${pi.pieceId} capture 1v1`;
-                        return pi.pieceId;
-                    }
-                    // Bàn 3-4 người: chỉ lấy nếu không bị phản đòn từ người khác
-                    const dangerAfter = enemies.some(e => {
-                        if (e.owner === cap.owner || e.pathPos < 0 || e.safe) return false;
-                        const dist = (newPos - e.pathPos + PL) % PL;
-                        return dist >= 1 && dist <= 6;
-                    });
-                    if (safeAfter || !dangerAfter) {
-                        log(`[PRO] ⚔️ Q${pi.pieceId} ăn P${cap.owner}`);
-                        trackPiece(rp, pi.pieceId);
-                        ST.lastReason = `⚔️ Q${pi.pieceId} capture`;
-                        return pi.pieceId;
+
+        // [RULE 3] HY SINH CUOI GAME: neu doi thu sap ve dich
+        if (phase === 'late') {
+            var oppAboutToWin = enemies.some(function(e) {
+                if (e.safe || e.pathPos < 0) return false;
+                var adv = advancement(EN[e.owner], e.pathPos);
+                return (52 - adv) <= 12;
+            });
+            if (oppAboutToWin) {
+                for (var pi_idx = 0; pi_idx < info.length; pi_idx++) {
+                    var pi = info[pi_idx];
+                    if (!pi.atHome && !pi.inHS) {
+                        var cap = canCapture(pi, dice, enemies);
+                        if (cap) {
+                            log('[PRO] \ud83e\udd85 HY SINH: Q' + pi.pieceId + ' bat P' + cap.owner + ' (doi thu sap thang!)');
+                            trackPiece(rp, pi.pieceId);
+                            ST.lastReason = '\ud83e\udd85 Hy sinh Q' + pi.pieceId + ' bat P' + cap.owner;
+                            return pi.pieceId;
+                        }
                     }
                 }
             }
         }
-        
-        // 4. Cứu quân đang nguy hiểm (di chuyển vào ô an toàn)
-        for (const pi of info) {
+
+        // [RULE 4] AN QUAN CO KIEM SOAT
+        var oppCount = parsed.opponentCount || 3;
+        for (var pi_idx = 0; pi_idx < info.length; pi_idx++) {
+            var pi = info[pi_idx];
+            if (!pi.atHome && !pi.inHS) {
+                var cap = canCapture(pi, dice, enemies);
+                if (cap) {
+                    var capAdv = advancement(EN[cap.owner], cap.pathPos);
+                    var capIsValuable = capAdv > 20;
+                    var newPos = (pi.pathPos + dice) % 52;
+                    var safeAfter = isSafePos(newPos);
+                    
+                    if (oppCount === 1) {
+                        log('[PRO] \u2694\ufe0f Q' + pi.pieceId + ' an P' + cap.owner + ' [1v1]');
+                        trackPiece(rp, pi.pieceId);
+                        ST.lastReason = '\u2694\ufe0f Q' + pi.pieceId + ' capture 1v1';
+                        return pi.pieceId;
+                    }
+                    
+                    if (capIsValuable || safeAfter) {
+                        var dangerAfter = enemies.some(function(e) {
+                            if (e.owner === cap.owner || e.pathPos < 0 || e.safe) return false;
+                            var dist = (newPos - e.pathPos + 52) % 52;
+                            return dist >= 1 && dist <= 6;
+                        });
+                        if (safeAfter || !dangerAfter) {
+                            log('[PRO] \u2694\ufe0f Q' + pi.pieceId + ' an P' + cap.owner + ' (quan ' + (capIsValuable ? 'tien xa' : 'moi ra') + ', safe=' + safeAfter + ')');
+                            trackPiece(rp, pi.pieceId);
+                            ST.lastReason = '\u2694\ufe0f Q' + pi.pieceId + ' bat P' + cap.owner;
+                            return pi.pieceId;
+                        }
+                    }
+                }
+            }
+        }
+
+        // [RULE 5] CUU QUAN DANG NGUY HIEM
+        for (var pi_idx = 0; pi_idx < info.length; pi_idx++) {
+            var pi = info[pi_idx];
             if (!pi.atHome && !pi.inHS && !pi.safe) {
-                const isThreatened = enemies.some(e => {
+                var isThreatened = enemies.some(function(e) {
                     if (e.pathPos < 0 || e.safe) return false;
-                    const dist = (pi.pathPos - e.pathPos + PL) % PL;
+                    var dist = (pi.pathPos - e.pathPos + 52) % 52;
                     return dist >= 1 && dist <= 6;
                 });
                 if (isThreatened) {
-                    const newPos = (pi.pathPos + dice) % PL;
-                    const willBeSafe = isSafePos(newPos);
+                    var newPos2 = (pi.pathPos + dice) % 52;
+                    var willBeSafe = isSafePos(newPos2);
                     if (willBeSafe) {
-                        log(`[PRO] 🛡️ Q${pi.pieceId} thoát hiểm!`);
+                        log('[PRO] \ud83d\udee1\ufe0f Q' + pi.pieceId + ' thoat hiem!');
                         trackPiece(rp, pi.pieceId);
-                        ST.lastReason = `🛡️ Q${pi.pieceId} thoát`;
+                        ST.lastReason = '\ud83d\udee1\ufe0f Q' + pi.pieceId + ' thoat';
                         return pi.pieceId;
                     }
                 }
             }
         }
 
-        // 5-10. Scoring-based selection with depth (áp dụng khi không có hard rule nào khớp)
+        // === SCORING-BASED SELECTION ===
         const searchState = makeSearchState(parsed, myPos);
         const allMoves = getValidMoves(searchState, myPos, dice);
+        const totalActive = info.filter(function(i) { return !i.atHome; }).length;
         
-        let candidates = [];
-        for (const pi of info) {
-            const move = allMoves.find(m => m.pid === pi.pieceId);
-            if (!move) continue;
-            
-            // Calculate total score with depth
-            const totalScore = evaluateWithDepth(move, pi, dice, myPos, parsed, enemies, phase);
-            
-            // Recent-pieces penalty (chống spam 1 quân)
-            const used = rp[String(pi.pieceId)] || 0;
-            const spamPenalty = used * 10; // -10 per use
-            
-            // Phase-based final weighting
-            let finalScore = totalScore - spamPenalty;
-            
-            if (phase === 'late' && pi.inHS) finalScore += 30; // cuối game ưu tiên HS
-            if (pi.atHome && dice === 6) finalScore += 40; // xuất quân có giá trị ở mọi giai đoạn
-            
-            candidates.push({ pid: pi.pieceId, score: finalScore, adv: pi.adv||0, safe: pi.safe });
-            log(`   [PRO] Q${pi.pieceId}: total=${totalScore.toFixed(2)}${used>0?' -spam='+spamPenalty:''} = ${finalScore.toFixed(2)}`);
+        // Leapfrog detection
+        var leapfrogSet = {};
+        for (var pi_idx = 0; pi_idx < info.length; pi_idx++) {
+            var pi = info[pi_idx];
+            if (pi.atHome || pi.inHS || pi.pathPos < 0) continue;
+            var behind = info.filter(function(pj) {
+                return !pj.atHome && !pj.inHS && pj.pathPos >= 0 &&
+                    pj.pieceId !== pi.pieceId &&
+                    pj.adv > pi.adv &&
+                    (pj.adv - pi.adv) < 25;
+            });
+            if (behind.length > 0) {
+                var newPathPos = (pi.pathPos + dice) % 52;
+                var canThreatenAfter = enemies.some(function(e) {
+                    if (e.pathPos < 0 || e.safe) return false;
+                    var dist = forwardDist(newPathPos, e.pathPos);
+                    return dist >= 1 && dist <= 6;
+                });
+                if (canThreatenAfter) {
+                    leapfrogSet[pi.pieceId] = true;
+                }
+            }
         }
         
-        // Pick best
+        // Opponent about to win
+        var oppCloseToWin = enemies.some(function(e) {
+            if (e.safe || e.pathPos < 0) return false;
+            var adv = advancement(EN[e.owner], e.pathPos);
+            return (52 - adv) <= 12;
+        });
+        
+        var candidates = [];
+        for (var pi_idx = 0; pi_idx < info.length; pi_idx++) {
+            var pi = info[pi_idx];
+            var move = allMoves.find(function(m) { return m.pid === pi.pieceId; });
+            if (!move) continue;
+            
+            var extraInfo = {};
+            
+            if (leapfrogSet[pi.pieceId]) extraInfo._leapfrog = true;
+            
+            var willFinish = move.finish;
+            var activeAfter = totalActive - (willFinish ? 1 : 0);
+            extraInfo._activePiecesAfter = activeAfter;
+            extraInfo._totalActive = totalActive;
+            
+            if (phase === 'mid') {
+                var spreadCount = info.filter(function(i) { return !i.atHome && i.pieceId !== pi.pieceId; }).length;
+                if (spreadCount >= 1) extraInfo._spreadBonus = true;
+            }
+            
+            if (phase === 'late' && oppCloseToWin && move.capture) {
+                extraInfo._sacrificialCapture = true;
+            }
+            
+            const totalScore = evaluateWithDepth(move, pi, dice, myPos, parsed, enemies, phase, extraInfo);
+            
+            var used = rp[String(pi.pieceId)] || 0;
+            var spamPenalty = used * 12;
+            
+            var activeOthers = info.filter(function(i) { return !i.atHome && i.pieceId !== pi.pieceId; }).length;
+            if (totalActive <= 1 && activeOthers === 0 && !willFinish) {
+                spamPenalty += 30;
+            }
+            
+            var finalScore = totalScore - spamPenalty;
+            if (phase === 'late' && pi.inHS) finalScore += 50;
+            if (pi.atHome && dice === 6) finalScore += 40;
+            
+            candidates.push({ pid: pi.pieceId, score: finalScore, adv: pi.adv || 0, safe: pi.safe, inHS: pi.inHS });
+            log('   [PRO] Q' + pi.pieceId + ': total=' + totalScore.toFixed(2) + (used > 0 ? ' -spam=' + spamPenalty : '') + ' = ' + finalScore.toFixed(2));
+        }
+        
         if (candidates.length === 0) {
-            log(`[PRO] ⚠️ No valid moves, fallback Q${pieces[0]}`);
+            log('[PRO] Khong co nuoc di hop le, fallback Q' + pieces[0]);
             trackPiece(rp, pieces[0]);
-            ST.lastReason = `[PRO] fallback Q${pieces[0]}`;
+            ST.lastReason = '[PRO] fallback Q' + pieces[0];
             return pieces[0];
         }
         
-        candidates.sort((a, b) => b.score !== a.score ? b.score - a.score : b.adv - a.adv);
-        const best = candidates[0];
+        candidates.sort(function(a, b) {
+            if (b.score !== a.score) return b.score - a.score;
+            if (a.safe !== b.safe) return a.safe ? -1 : 1;
+            return b.adv - a.adv;
+        });
+        var best = candidates[0];
         
         trackPiece(rp, best.pid);
-        log(`[PRO] → Q${best.pid} score=${best.score.toFixed(2)}`);
-        ST.lastReason = `[PRO] Q${best.pid} ${best.score.toFixed(0)}đ`;
+        log('[PRO] -> Q' + best.pid + ' score=' + best.score.toFixed(2));
+        ST.lastReason = '[PRO] Q' + best.pid + ' ' + best.score.toFixed(0) + 'd';
         return best.pid;
     }
+
+
 
     function trackPiece(rp, pid) {
         rp[String(pid)] = (rp[String(pid)] || 0) + 1;
